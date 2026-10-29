@@ -1,0 +1,57 @@
+[
+ {
+  "name": "apache_fineract",
+  "url": "https://github.com/apache/fineract",
+  "commit": "534c4d69a7a73175b715fa2576658d0474408c15"
+ },
+ {
+  "name": "aws-samples_samples-for-payment-cryptography-service",
+  "url": "https://github.com/aws-samples/samples-for-payment-cryptography-service",
+  "commit": "0bff4d1b25e5e27ef48dda237992dc984f1bdb5f"
+ },
+ {
+  "name": "Consensys_quorum",
+  "url": "https://github.com/Consensys/quorum",
+  "commit": "5ffacc482866197bd500062abfd6dca33262ac67"
+ },
+ {
+  "name": "Consensys_tessera",
+  "url": "https://github.com/Consensys/tessera",
+  "commit": "f191004f1d01e5e472d049179b5e6e8054d98da3"
+ },
+ {
+  "name": "goldmansachs_gs-quant",
+  "url": "https://github.com/goldmansachs/gs-quant",
+  "commit": "e2b98f5fa0bfd3a931b9a6fcbee84c027588edea"
+ },
+ {
+  "name": "hyperledger_fabric",
+  "url": "https://github.com/hyperledger/fabric",
+  "commit": "0a669a8777515de209491077ed9eba6a203c7d40"
+ },
+ {
+  "name": "jpmorganchase_fusion",
+  "url": "https://github.com/jpmorganchase/fusion",
+  "commit": "a0d6e547f7adcaeeaddf7b96fdc0d0efe50a2491"
+ },
+ {
+  "name": "juspay_hyperswitch",
+  "url": "https://github.com/juspay/hyperswitch",
+  "commit": "d7052a400020de5e90ea0b7c27b24dc28d8f9c1e"
+ },
+ {
+  "name": "moov-io_ach",
+  "url": "https://github.com/moov-io/ach",
+  "commit": "475edbb91e573822ef79ece25943e3dbc2579e8f"
+ },
+ {
+  "name": "moov-io_iso8583",
+  "url": "https://github.com/moov-io/iso8583",
+  "commit": "5972bcd0d8af54abe97ba06e77de23fb6d0e499a"
+ },
+ {
+  "name": "OpenBankProject_OBP-API",
+  "url": "https://github.com/OpenBankProject/OBP-API",
+  "commit": "6998b13477e21b34b57e35c53184c29154c4defe"
+ }
+]

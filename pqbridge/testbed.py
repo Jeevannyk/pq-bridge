@@ -223,7 +223,7 @@ def apply_state(st, changed):
 def up():
     for d in (PKI, STATE, CONF, RUNTIME / "evidence"):
         d.mkdir(parents=True, exist_ok=True)
-    compose("build")
+    compose("build", timeout=3600)        # first build compiles liboqs; slow laptops need well over 15 min
     compose("up", "-d", "toolbox")
     if not (PKI / "rsa-root.crt").exists():
         pki_init()

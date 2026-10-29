@@ -37,6 +37,8 @@ def scan():
 
 def repos():
     """Hybrid detection engine (rules + ML + crypto verification) over real bank / fintech repos."""
+    if not detect.REPOS.exists() or not any(detect.REPOS.iterdir()):
+        raise RuntimeError("real repositories not fetched yet: run `python -m pqbridge.fetch_repos` (about 450 MB)")
     log("Evaluating detection engine leave-one-repo-out on labelled lines from real repos")
     ev = detect.evaluate()
     b = ev["methods"]["fused: balanced"]

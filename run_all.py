@@ -10,10 +10,11 @@ QAOA, QRNG health, wave gate results, before/after TLS traces, report).
 import json
 import sys
 
-from pqbridge import pipeline
+from pqbridge import fetch_repos, pipeline
 
 
 def main():
+    fetch_repos.run()         # real repos at pinned commits (skips what is already there); fail early on network
     if "--no-reset" not in sys.argv:
         pipeline.reset()
     pipeline.scan()
