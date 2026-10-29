@@ -107,14 +107,18 @@ const SCENARIOS = [
     why: "Legacy customer apps trust only the RSA root. Expect: legacy client fails → gate fails → rollback.",
     can: (tv) => tvDone(tv, "pki.pq-root") && !tvDone(tv, "cert.gateway-public"),
     cant: "Needs the PQ PKI (apply pki.pq-root first)." },
-  { id: "jwt.sign-fndsa", title: "JWT issuer switched before verifiers accept FN-DSA",
-    why: "card-auth signs FN-DSA tokens while payment-switch still accepts only RS256. Expect: 401s, failed payments, rollback.",
-    can: (tv) => !tvDone(tv, "jwt.dual-verify") && !tvDone(tv, "jwt.sign-fndsa"),
-    cant: "Already safe: jwt.dual-verify is applied. Reset the bank to demonstrate." },
-  { id: "pqonly.ledger", title: "Ledger forced to PQ-only before its client speaks HQC",
-    why: "payment-switch still offers only classical groups. Expect: ledger unreachable, failed payments, rollback.",
-    can: (tv) => !tvDone(tv, "kex.payment-switch") && !tvDone(tv, "pqonly.ledger"),
-    cant: "Already safe: payment-switch speaks HQC. Reset the bank to demonstrate." },
+  { id: "jwt.sign-fndsa", title: "Token signer switched before the APIs accept FN-DSA",
+    why: "Identity issues FN-DSA access tokens while accounts and payments still accept only RS256 (or the KMS has no FN-DSA key yet). Expect: every API call 401, failed customer requests, rollback.",
+    can: (tv) => !tvDone(tv, "jwt.accept-payments") && !tvDone(tv, "jwt.sign-fndsa"),
+    cant: "Already safe: the APIs accept FN-DSA tokens. Reset the bank to demonstrate." },
+  { id: "settle.sign-slhdsa", title: "Settlement signed with SLH-DSA before the clearing house trusts the key",
+    why: "The bank signs its end-of-day batch with a key the external clearing house does not trust. Expect: batch rejected by the partner, gate fails, rollback.",
+    can: (tv) => !tvDone(tv, "partner.clearing") && !tvDone(tv, "settle.sign-slhdsa"),
+    cant: "Already safe: the clearing house trusts the SLH-DSA key. Reset the bank to demonstrate." },
+  { id: "pqonly.postgres", title: "Database forced to PQ-only before its clients speak HQC",
+    why: "Some services still offer only classical key exchange to the database. Expect: logins and transfers fail, rollback.",
+    can: (tv) => !tvDone(tv, "pqonly.postgres") && ["kex.identity", "kex.accounts", "kex.payments", "kex.ledger", "kex.settlement"].some((k) => !tvDone(tv, k)),
+    cant: "Already safe: every database client speaks HQC. Reset the bank to demonstrate." },
 ];
 const tvDone = (tv, id) => ((tv.tasks.find((t) => t.id === id) || {}).done);
 
@@ -132,15 +136,20 @@ function renderControl(tv) {
   const el = document.getElementById("control-body");
   if (!el || !tv) return;
   const st = tv.state;
-  const svcs = ["gateway", "card-auth", "payment-switch", "ledger"];
+  const svcs = Object.keys(st).filter((s) => !s.startsWith("_"));
+  const app = (s, v) => [
+    v.jwt_alg && `signs tokens ${v.jwt_alg}`, v.jwt_publish && `JWKS: ${v.jwt_publish.join(" + ")}`,
+    v.jwt_accept && `accepts ${v.jwt_accept.join(" + ")}`, v.audit_alg && `audit ${v.audit_alg}`,
+    v.settle_alg && `settlement ${v.settle_alg}`, v.accept_settle && `partner accepts ${v.accept_settle.join(" + ")}`,
+  ].filter(Boolean).join("<br>") || "–";
   const ar = autoRollback();
   el.innerHTML = `
   <div class="card"><h3>Live crypto posture of the bank</h3>
-    <div class="scroll"><table class="matrix"><tr><th>Service</th><th>Key exchange</th><th>TLS identity</th><th>Trust store</th><th>JWT</th><th>Test it now (real handshake)</th></tr>
-    ${svcs.map((s) => `<tr><td><b>${s}</b></td><td>${cryptoPill("kex", st[s].kex)}</td>
+    <div class="scroll"><table class="matrix"><tr><th>Service</th><th>Key exchange</th><th>TLS identity</th><th>Trust store</th><th>Application crypto</th><th>Test it now (real handshake)</th></tr>
+    ${svcs.map((s) => `<tr><td><b>${s}</b>${s === "clearing" ? "<br><small class='empty'>external partner</small>" : ""}</td><td>${cryptoPill("kex", st[s].kex)}</td>
       <td>${s === "gateway" ? `public ${cryptoPill("cert", st[s].public_cert)}<br>internal ${cryptoPill("cert", st[s].cert)}` : cryptoPill("cert", st[s].cert)}</td>
       <td>${cryptoPill("trust", st[s].trust)}</td>
-      <td class="mono">${s === "card-auth" ? `signs ${esc(st[s].jwt_alg)}` : s === "payment-switch" ? `accepts ${esc(st[s].jwt_accept.join(" + "))}` : "–"}</td>
+      <td class="mono">${app(s, st[s])}</td>
       <td><button class="ghost small" data-m="probe" data-svc="${s}" data-mode="default">modern client</button>
           <button class="ghost small" data-m="probe" data-svc="${s}" data-mode="classical">classical client</button></td></tr>`).join("")}</table></div>
     <div id="probe-out"></div></div>

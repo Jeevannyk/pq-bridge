@@ -12,7 +12,14 @@ The cubic term is passed to QpiAI Opt as-is (native HUBO, no quadratisation). Th
 capacity (effort <= CAP) is enforced by the validator and by the exact CP-SAT baseline. An earlier
 slack-variable encoding of capacity made QpiAI Opt's local annealer return infeasible plans in every
 run (2-5 violations); the crowding term keeps the landscape smooth and leaves capacity to the validator.
-QpiAI Opt is run multi-start (several seeds) and the best feasible plan is kept.
+The bank has 37 tasks x 4 windows = 148 binaries. Exact pruning removes windows a task can never use (it needs
+its whole prerequisite chain before it and its dependents' chain after it), leaving 82 binaries / ~1,090 terms,
+which fits QpiAI Opt's local HUBO solver (100 variables, 1,500 terms). QpiAI Opt solves the whole HUBO natively,
+cubic terms included, from 8 starts; a task an annealer sample leaves in 0 or 2+ windows is one-hot decoded
+(lowest-energy window); the best plan that passes the validator is kept. The crowding weight K is small (0.1): it
+only breaks ties toward spreading work, so the HUBO optimum stays close to the business optimum. A larger bank
+falls back to decomposition (large-neighbourhood search over 20-task blocks). The cloud HUBO solver is not enabled
+for our QpiAI organisation.
 """
 import itertools
 import json
@@ -25,11 +32,12 @@ from . import config
 from .tasks import BLACKOUT, BLAST_TRIPLES, TASK_BY_ID, TASKS
 
 WINDOWS = 4
-CAP = 5
+CAP = 12
 SLACK = [1, 2, 2]
-PEN = {"A": 80.0, "B": 80.0, "C": 40.0, "E": 80.0, "K": 4.0}   # C: pairwise capacity penalty in the QAOA sub-QUBO
-QPIAI_SEEDS = 8
-QPIAI_SAMPLING = {"num_reads": 8, "num_sweeps": 600}   # within QpiAI's local annealing-work limit
+PEN = {"A": 80.0, "B": 80.0, "C": 40.0, "E": 80.0, "K": 0.1}   # C: pairwise capacity penalty in the QAOA sub-QUBO
+QPIAI_SEEDS = 2                                       # per decomposition round (fallback path)
+QPIAI_SAMPLING = {"num_reads": 2, "num_sweeps": 2000}  # within QpiAI's local annealing-work limit
+LNS_BLOCK, LNS_ROUNDS = 20, 20
 BLACKOUT_COST = 25.0
 
 
@@ -46,16 +54,35 @@ def blackout_cost(task_id, w):
     return BLACKOUT_COST if (w == BLACKOUT["window"] and t["service"] in BLACKOUT["services"]) else 0.0
 
 
+def domains():
+    """Exact pruning: a task can only sit in windows [longest prerequisite chain above it,
+    WINDOWS-1 - longest chain of dependents below it]. Removing other windows loses no feasible plan."""
+    kids = {t["id"]: [s["id"] for s in TASKS if t["id"] in s["deps"]] for t in TASKS}
+    memo_d, memo_h = {}, {}
+
+    def depth(t):
+        if t not in memo_d:
+            memo_d[t] = max([depth(d) + 1 for d in TASK_BY_ID[t]["deps"]], default=0)
+        return memo_d[t]
+
+    def height(t):
+        if t not in memo_h:
+            memo_h[t] = max([height(k) + 1 for k in kids[t]], default=0)
+        return memo_h[t]
+    return {t["id"]: list(range(depth(t["id"]), WINDOWS - height(t["id"]))) for t in TASKS}
+
+
 def build(risks, pen=None):
     pen = {**PEN, **(pen or {})}
     P = defaultdict(float)
+    dom = domains()
 
     def add(vars_, c):
         P[tuple(sorted(set(vars_)))] += c
 
     ids = [t["id"] for t in TASKS]
-    for t in ids:                                       # one-hot
-        xs = [xv(t, w) for w in range(WINDOWS)]
+    for t in ids:                                       # one-hot (over the task's allowed windows)
+        xs = [xv(t, w) for w in dom[t]]
         add((), pen["A"])
         for v in xs:
             add((v,), -pen["A"])
@@ -63,17 +90,20 @@ def build(risks, pen=None):
             add((a, b), 2 * pen["A"])
     for s in ids:                                       # precedence
         for d in TASK_BY_ID[s]["deps"]:
-            for w in range(WINDOWS):
-                for w2 in range(w, WINDOWS):
-                    add((xv(s, w), xv(d, w2)), pen["B"])
+            for w in dom[s]:
+                for w2 in dom[d]:
+                    if w2 >= w:
+                        add((xv(s, w), xv(d, w2)), pen["B"])
     for w in range(WINDOWS):                            # crowding (capacity enforced by the validator)
-        for a, b in itertools.combinations(ids, 2):
+        here = [t for t in ids if w in dom[t]]
+        for a, b in itertools.combinations(here, 2):
             add((xv(a, w), xv(b, w)), pen["K"] * TASK_BY_ID[a]["effort"] * TASK_BY_ID[b]["effort"])
     for trip in BLAST_TRIPLES:                          # cubic blast-radius
         for w in range(WINDOWS):
-            add(tuple(xv(t, w) for t in trip), pen["E"])
+            if all(w in dom[t] for t in trip):
+                add(tuple(xv(t, w) for t in trip), pen["E"])
     for t in ids:                                       # objective
-        for w in range(WINDOWS):
+        for w in dom[t]:
             c = risks[t] * w + blackout_cost(t, w)
             if c:
                 add((xv(t, w),), c)
@@ -229,63 +259,83 @@ def solve_greedy(risks):
             if all(d in plan for d in t["deps"]):
                 break
         earliest = max([plan[d] + 1 for d in t["deps"]], default=0)
-        for w in range(earliest, WINDOWS):
+
+        def fits(w, freeze_ok):
             blast = any(t["id"] in trip and sum(plan.get(o) == w for o in trip if o != t["id"]) == 2
                         for trip in BLAST_TRIPLES)
-            if load[w] + t["effort"] <= CAP and not blast and not blackout_cost(t["id"], w):
-                break
-        else:
-            w = WINDOWS - 1
+            return load[w] + t["effort"] <= CAP and not blast and (freeze_ok or not blackout_cost(t["id"], w))
+        # earliest window that respects capacity, blast radius and the freeze; then relax only the freeze (a cost)
+        w = next((w for w in range(earliest, WINDOWS) if fits(w, False)),
+                 next((w for w in range(earliest, WINDOWS) if fits(w, True)), WINDOWS - 1))
         plan[t["id"]] = w
         load[w] += t["effort"]
         remaining.remove(t)
     return plan, {"solver": "Greedy (risk-first, manual-style)"}
 
 
+def restrict(P, fixed):
+    """Substitute fixed binaries (var -> 0/1) into a polynomial; returns the sub-polynomial over the free ones."""
+    Q = defaultdict(float)
+    for k, c in P.items():
+        rest = []
+        for v in k:
+            if v in fixed:
+                if not fixed[v]:
+                    c = 0.0
+                    break
+            else:
+                rest.append(v)
+        if c:
+            Q[tuple(rest)] += c
+    Q = {k: v for k, v in Q.items() if v}
+    return Q, sorted({v for k in Q for v in k})
+
+
+def _onehot_decode(P, plan, block):
+    """Standard one-hot decoding of an annealer sample: a task the sample left in 0 or 2+ windows gets the window
+    with the lowest HUBO energy given every other assignment. Returns how many tasks needed it."""
+    ids = [t["id"] for t in TASKS]
+    dom = domains()
+    bad = [t for t in block if not isinstance(plan[t], int)]
+    for t in bad:
+        plan[t] = None
+    for t in bad:
+        best = None
+        for w in dom[t]:
+            plan[t] = w
+            e = energy(P, {xv(u, ww): int(plan[u] == ww) for u in ids if isinstance(plan[u], int) for ww in range(WINDOWS)})
+            if best is None or e < best[0]:
+                best = (e, w)
+        plan[t] = best[1]
+    return len(bad)
+
+
+def _score(plan, risks):
+    v = validate(plan)
+    return (len(v), business(plan, risks)["objective"] if not v else float("inf"))
+
+
+LOCAL_HUBO = {"variables": 100, "terms": 1500}          # qpiai_opt LOCAL_LIMITS["HUBO"]
+
+
 def optimise(risks, log=print, use_qpiai=True):
-    """Build the HUBO, solve on QpiAI Opt (retrying with stronger penalties if infeasible), compare baselines."""
-    result = {"windows": WINDOWS, "capacity": CAP, "penalties": dict(PEN), "risks": risks, "attempts": []}
-    best = None                                    # (objective, plan, meta)
-    for scale in (1.0, 0.75):                      # penalty 80, then 60 if nothing feasible
-        pen = {k: (v * scale if k in "ABE" else v) for k, v in PEN.items()}
-        P, names = build(risks, pen)
-        result["hubo"] = stats(P, names)
-        for seed in range(QPIAI_SEEDS):
-            try:
-                if not use_qpiai:
-                    raise RuntimeError("QpiAI disabled")
-                assign, meta = solve_qpiai(P, names, log, seed=seed)
-            except Exception as e:
-                if seed == 0:
-                    log(f"QpiAI Opt unavailable ({str(e)[:120]}); using classical SA fallback")
-                assign, meta = solve_sa(P, names, seed=seed)
-                meta["fallback_reason"] = str(e)[:200]
-            plan = decode(assign)
-            viol = validate(plan)
-            obj = business(plan, risks)["objective"] if not viol else None
-            meta.update({"energy": round(energy(P, assign), 3), "violations": viol, "penalties": dict(pen),
-                         "plan_objective": obj})
-            result["attempts"].append(meta)
-            if not viol and (best is None or obj < best[0]):
-                best = (obj, plan, meta)
-            if meta.get("fallback_reason"):
-                break                              # SA fallback is slow; one run per setting
-        feasible = sum(1 for a in result["attempts"] if not a["violations"])
-        log(f"{result['attempts'][-1]['solver']}: {feasible}/{len(result['attempts'])} runs feasible so far "
-            f"(penalty x{scale})")
-        if best:
-            break
-    if best is None:
-        raise RuntimeError("no feasible plan from any solver run; see attempts in plan.json")
-    primary = (best[1], best[2])
-    plan, meta = primary
+    """Build the (pruned) HUBO and solve it on QpiAI Opt: the whole HUBO natively, multi-start, when it fits the
+    local solver; otherwise block by block (LNS). Compare with exact CP-SAT and greedy."""
+    P, names = build(risks)
+    if len(names) <= LOCAL_HUBO["variables"] and len(P) <= LOCAL_HUBO["terms"]:
+        return _optimise_native(risks, P, names, log, use_qpiai)
+    return _optimise_lns(risks, log, use_qpiai)
+
+
+def _finish(result, risks, plan, meta, P, log):
     result["plan"] = plan
     result["waves"] = waves(plan)
+    result["blackout"] = BLACKOUT
     result["primary"] = {**meta, **business(plan, risks)}
     base = {}
     for fn in (solve_cpsat, solve_greedy):
-        p, m = fn(risks)
-        base[m["solver"]] = {**m, **business(p, risks), "violations": validate(p), "plan": p}
+        bp, m = fn(risks)
+        base[m["solver"]] = {**m, **business(bp, risks), "violations": validate(bp), "plan": bp}
     result["baselines"] = base
     exact = base["OR-Tools CP-SAT (exact)"]["objective"]
     result["primary"]["optimality_gap_pct"] = round(100 * (result["primary"]["objective"] - exact) / exact, 2) if exact else 0.0
@@ -294,3 +344,99 @@ def optimise(risks, log=print, use_qpiai=True):
     (config.EVIDENCE / "plan.json").write_text(json.dumps(result, indent=1))
     return result
 
+
+def _optimise_native(risks, P, names, log, use_qpiai, seeds=16):
+    dom = domains()
+    result = {"windows": WINDOWS, "capacity": CAP, "penalties": dict(PEN), "risks": risks, "attempts": [],
+              "hubo": stats(P, names), "domains": dom,
+              "method": f"QpiAI Opt native HUBO over {len(names)} binaries (windows pruned by dependency chains), "
+                        f"{seeds} starts, best feasible kept"}
+    log(f"HUBO {len(names)} binaries / {len(P)} terms ({result['hubo']['terms_by_degree'].get(3, 0)} cubic) after exact "
+        f"pruning from {len(TASKS) * WINDOWS}: fits QpiAI Opt's local solver")
+    best, used_fallback = None, None
+    for seed in range(seeds):
+        try:
+            if not use_qpiai:
+                raise RuntimeError("QpiAI disabled")
+            assign, meta = solve_qpiai(P, names, log, seed=seed)
+        except Exception as e:
+            used_fallback = str(e)[:200]
+            assign, meta = solve_sa(P, names, reads=2, sweeps=800, seed=seed)
+        plan = decode(assign)
+        n_dec = _onehot_decode(P, plan, list(plan))
+        viol = validate(plan)
+        obj = business(plan, risks)["objective"] if not viol else None
+        meta.update({"energy": round(energy(P, assign), 3), "violations": viol, "plan_objective": obj, "onehot_decoded": n_dec})
+        result["attempts"].append(meta)
+        if not viol and (best is None or obj < best[0]):
+            best = (obj, plan, meta)
+    feas = sum(1 for a in result["attempts"] if not a["violations"])
+    log(f"{result['attempts'][0]['solver']}: {feas}/{seeds} starts feasible")
+    if best is None:
+        log("no feasible start; falling back to decomposition")
+        return _optimise_lns(risks, log, use_qpiai)
+    meta = {**best[2], "solver": "QpiAI Opt (native HUBO, local)" if not used_fallback else "Simulated annealing (classical fallback)",
+            "starts": seeds, "feasible_starts": feas}
+    if used_fallback:
+        meta["fallback_reason"] = used_fallback
+    return _finish(result, risks, best[1], meta, P, log)
+
+
+def _optimise_lns(risks, log=print, use_qpiai=True):
+    """Decomposition (large-neighbourhood search) for HUBOs larger than the local solver's limit."""
+    import random as _r
+    result = {"windows": WINDOWS, "capacity": CAP, "penalties": dict(PEN), "risks": risks, "attempts": [],
+              "method": f"QpiAI Opt native HUBO, decomposed: {LNS_ROUNDS} rounds x {LNS_BLOCK}-task blocks"}
+    P, names = build(risks)
+    result["hubo"] = stats(P, names)
+    ids = [t["id"] for t in TASKS]
+    plan, _ = solve_greedy(risks)
+    start_obj = business(plan, risks)["objective"]
+    cur = _score(plan, risks)
+    log(f"HUBO {result['hubo']['variables']} binaries / {result['hubo']['terms']} terms; start (greedy): cost {start_obj}, "
+        f"{cur[0]} violations")
+    rng = _r.Random(7)
+    t0, qtime, used_fallback = time.time(), 0.0, None
+    for rnd in range(LNS_ROUNDS):
+        # tasks named in a current violation are always freed; the rest of the block is random, or (odd rounds)
+        # drawn from two windows so tasks can swap windows
+        bad = [t for t in ids if any(t in v for v in validate(plan))]
+        pool = [t for t in ids if t not in bad]
+        if rnd % 2:
+            w1, w2 = rng.sample(range(WINDOWS), 2)
+            pool = [t for t in pool if plan[t] in (w1, w2)] or pool
+        block = bad[:LNS_BLOCK] + rng.sample(pool, max(0, min(len(pool), LNS_BLOCK - len(bad))))
+        fixed = {xv(t, w): int(plan[t] == w) for t in ids if t not in block for w in range(WINDOWS)}
+        sub, sub_names = restrict(P, fixed)
+        for seed in range(QPIAI_SEEDS):
+            try:
+                if not use_qpiai:
+                    raise RuntimeError("QpiAI disabled")
+                assign, meta = solve_qpiai(sub, sub_names, log, seed=rnd * 10 + seed)
+            except Exception as e:
+                used_fallback = str(e)[:200]
+                assign, meta = solve_sa(sub, sub_names, reads=2, sweeps=400, seed=rnd * 10 + seed)
+            qtime += meta.get("solver_time_s") or meta.get("wall_s") or 0
+            cand = dict(plan)
+            for t in block:
+                ws = [w for w in range(WINDOWS) if assign.get(xv(t, w), 0)]
+                cand[t] = ws[0] if len(ws) == 1 else None
+            fixed_onehot = _onehot_decode(P, cand, block)
+            sc = _score(cand, risks)
+            accepted = sc < cur
+            if accepted:
+                plan, cur = cand, sc
+            result["attempts"].append({"round": rnd, "seed": seed, "solver": meta["solver"], "onehot_decoded": fixed_onehot,
+                                       "sub_variables": len(sub_names),
+                                       "sub_terms": len(sub), "violations": validate(cand), "plan_objective": None if sc[0] else sc[1],
+                                       "accepted": accepted, "wall_s": meta.get("wall_s"), "solver_time_s": meta.get("solver_time_s")})
+    acc = sum(a["accepted"] for a in result["attempts"])
+    solver = "QpiAI Opt (native HUBO, decomposed)" if not used_fallback else "Simulated annealing (classical fallback, decomposed)"
+    log(f"{solver}: {len(result['attempts'])} sub-solves, {acc} improvements accepted; cost {start_obj} -> {cur[1]}")
+    meta = {"solver": solver, "wall_s": round(time.time() - t0, 2), "solver_time_s": round(qtime, 2),
+            "start": "greedy (risk-first)", "start_objective": start_obj, "sub_solves": len(result["attempts"]),
+            "accepted": acc, "violations": validate(plan), "energy": round(energy(P, {xv(t, w): int(plan[t] == w)
+                                                                                    for t in ids for w in range(WINDOWS)}), 3)}
+    if used_fallback:
+        meta["fallback_reason"] = used_fallback
+    return _finish(result, risks, plan, meta, P, log)

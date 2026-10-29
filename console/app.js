@@ -146,9 +146,9 @@ function renderPlan(qr) {
     [gr.solver, gr.objective, gr.violations.length, "", ((gr.objective - ex.objective) / ex.objective * 100).toFixed(2) + "%"],
   ];
   const q = p.qaoa;
-  const gantt = `<div class="gantt" style="--w:${W}"><div class="row"><div></div>${[...Array(W).keys()].map((w) => `<div class="hdr">Window ${w}${w === 1 ? " · freeze" : ""}</div>`).join("")}</div>
+  const gantt = `<div class="gantt" style="--w:${W}"><div class="row"><div></div>${[...Array(W).keys()].map((w) => `<div class="hdr">Window ${w}${p.blackout && w === p.blackout.window ? " · freeze" : ""}</div>`).join("")}</div>
     ${p.tasks.map((t) => `<div class="row"><div class="lab" title="${esc(t.title)}">${t.id}</div>${[...Array(W).keys()].map((w) =>
-      `<div class="cell ${p.final_plan[t.id] === w ? "on" : ""} ${w === 1 && t.service === "ledger" ? "freeze" : ""}" title="${p.final_plan[t.id] === w ? esc(t.title) : ""}"></div>`).join("")}</div>`).join("")}</div>`;
+      `<div class="cell ${p.final_plan[t.id] === w ? "on" : ""} ${p.blackout && w === p.blackout.window && p.blackout.services.includes(t.service) ? "freeze" : ""}" title="${p.final_plan[t.id] === w ? esc(t.title) : ""}"></div>`).join("")}</div>`).join("")}</div>`;
   $("#plan-body").className = "";
   $("#plan-body").innerHTML = `
   <div class="tiles">${tile("HUBO variables", p.hubo.variables, `${p.tasks.length} tasks × ${W} windows + slack`)}${tile("Terms", p.hubo.terms, `linear ${deg[1] || 0} · quad ${deg[2] || 0} · cubic ${deg[3] || 0}`)}

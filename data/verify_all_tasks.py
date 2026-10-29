@@ -42,10 +42,14 @@ def consistency():
             if not (RUNTIME / p.lstrip("/")).exists():
                 problems.append(f"{conf.name} references missing {p}")
     st = json.loads((RUNTIME / "state" / "services.json").read_text())
-    if st["card-auth"].get("jwt_alg") == "FN-DSA-512" and not (RUNTIME / "pki/jwt/fndsa512.key").exists():
-        problems.append("card-auth signs FN-DSA-512 but the key does not exist")
-    if "FN-DSA-512" in st["payment-switch"].get("jwt_accept", []) and not (RUNTIME / "pki/jwt/fndsa512.pub").exists():
-        problems.append("payment-switch accepts FN-DSA-512 but the public key does not exist")
+    kms = RUNTIME / "kms"
+    need = [("identity jwt_alg", st["identity"]["jwt_alg"] == "FN-DSA-512", kms / "jwt.fndsa.key"),
+            ("identity jwt_publish", "FN-DSA-512" in st["identity"]["jwt_publish"], kms / "jwt.fndsa.pub"),
+            ("ledger audit_alg", st["ledger"]["audit_alg"] == "FN-DSA-512", kms / "audit.fndsa.key"),
+            ("settlement settle_alg", st["settlement"]["settle_alg"].startswith("SLH-DSA"), kms / "settlement.slhdsa.key")]
+    for what, used, f in need:
+        if used and not f.exists():
+            problems.append(f"{what} uses a key that does not exist ({f.name})")
     return problems
 
 
@@ -90,6 +94,7 @@ def ordered():
     print("\n=== A. every task in dependency order, then roll everything back")
     reset()
     order = [t for t in toposort(tasks()) if t != "cert.gateway-public"]
+    print(f"    {len(order)} tasks")
     base_state = json.loads((RUNTIME / "state" / "services.json").read_text())
     applied = 0
     for t in order:
@@ -114,7 +119,7 @@ def ordered():
         if n > 40:
             break
     st = json.loads((RUNTIME / "state" / "services.json").read_text())
-    same = all(st[s][k] == base_state[s][k] for s in ("gateway", "card-auth", "payment-switch", "ledger") for k in base_state[s])
+    same = all(st[s] == base_state[s] for s in base_state if not s.startswith("_"))
     print(f"{check(same, 'rollback restores baseline')} after {n} rollbacks the crypto state equals the classical baseline: {same}")
     c, r = call("POST", "/api/gate")
     print(f"{check(c == 200 and r['passed'], 'baseline gate')} gate on the restored bank: {sum(x['passed'] for x in r['checks'])}/{len(r['checks'])}")
@@ -125,8 +130,8 @@ def forced():
     print("\n=== B. every task FORCED on a fresh bank (no prerequisites): clean outcome + consistent state")
     reset()
     ids = [t["id"] for t in tasks()]
-    first = [i for i in ids if i not in ("jwt.dual-verify", "pki.pq-root")]
-    for t in first + ["jwt.dual-verify", "pki.pq-root"]:
+    last = [i for i in ids if i.startswith("kms.key-")] + ["partner.clearing", "pki.pq-root"]   # leave key material behind
+    for t in [i for i in ids if i not in last] + last:
         c, r = call("POST", "/api/apply", {"tasks": [t], "force": True, "auto_rollback": True})
         clean_http = c == 200 and "checks" in r
         cons = consistency()
@@ -142,7 +147,7 @@ def forced():
             extra = f" -> manual rollback http={c2} healthy={r2.get('rollback', {}).get('healthy')}"
             cons += consistency()
             still = next(x for x in tasks() if x["id"] == t)["status"] == "applied"
-            if still and t != "jwt.dual-verify":
+            if still and t not in last:
                 cons.append("still applied after rollback")
         print(f"{check(not cons, 'forced ' + t)} force {t:22s} {kind:34s} rollback={rb} s pay_fail={r['traffic_delta']['pay_fail']}{extra}"
               + (f"\n        reason: {msg}" if msg else "") + (f"  !! {cons}" if cons else ""))
@@ -155,7 +160,8 @@ def chain():
     c, r = call("POST", "/api/apply", {"tasks": ["cert.ledger"]})
     ok = c == 409 and "Apply + prerequisites" in r.get("detail", "") and "pki.pq-root" in r.get("detail", "")
     print(f"{check(ok, 'refusal message')} plain apply of cert.ledger on a fresh bank -> http {c}: {r.get('detail', '')[:230]}")
-    for target in ["cert.ledger", "cert.gateway", "pqonly.ledger", "jwt.sign-fndsa", "cert.card-auth", "cert.payment-switch"]:
+    for target in ["cert.ledger", "jwt.sign-fndsa", "audit.sign-fndsa", "settle.sign-slhdsa", "pqonly.postgres", "cert.settlement",
+                   "cert.gateway", "pqonly.kms"]:
         c, r = call("POST", "/api/apply", {"tasks": [target], "with_deps": True})
         if c == 409:
             print(f"{check('already' in r.get('detail', ''), 'chain ' + target)} chain {target:20s} http 409: {r['detail'][:100]}")

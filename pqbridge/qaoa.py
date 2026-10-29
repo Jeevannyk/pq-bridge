@@ -1,7 +1,7 @@
 """QAOA cross-check of the schedule on QpiAI QCloud.
 
 The full schedule (76 binaries) is solved by QpiAI Opt. Here one dependency
-cluster (the JWT chain + card-auth key exchange) is re-optimised with every
+cluster (the JWT rollout: both verifiers accept, then identity signs) is re-optimised with every
 other task fixed to the Opt plan. The cluster sub-QUBO is mapped to an Ising
 Hamiltonian and solved with a QAOA circuit built gate-by-gate in the QpiAI
 Quantum SDK. The result is compared with the brute-force optimum.
@@ -18,7 +18,7 @@ from . import config
 from .qubo import BLACKOUT_COST, CAP, PEN, WINDOWS, blackout_cost
 from .tasks import TASK_BY_ID, TASKS
 
-CLUSTER = ["jwt.dual-verify", "jwt.sign-fndsa", "kex.card-auth"]
+CLUSTER = ["jwt.accept-accounts", "jwt.accept-payments", "jwt.sign-fndsa"]
 
 
 def sub_qubo(plan, risks, cluster=CLUSTER):

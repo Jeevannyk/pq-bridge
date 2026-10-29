@@ -60,12 +60,14 @@ COMMENT = re.compile(r"^\s*(#|//|/\*|\*|--|;)")
 def service_for(path: Path):
     p = path.as_posix()
     for s in config.SERVICES:
-        if f"/{s}." in p or f"/{s}/" in p or p.endswith(f"/{s}.conf"):
+        if f"/{s}." in p or f"/{s}/" in p or p.endswith(f"/{s}.conf") or p.endswith(f"/apps/{s}.py"):
             return s
     if "/pki/" in p:
         return "pki"
-    if p.endswith("apps/service.py"):
-        return "card-auth/payment-switch"
+    if p.endswith(("apps/bank.py", "openssl-oqs.cnf", "start.sh", "Dockerfile")):
+        return "all services"
+    if p.endswith("apps/dbinit.py"):
+        return "postgres"
     return None
 
 
@@ -211,7 +213,7 @@ def scan_endpoints():
     """Live TLS posture of every running bank service (real handshakes from the toolbox)."""
     from . import migrate, testbed
     out = []
-    for s in testbed.ROLES:
+    for s in testbed.BANK:
         h = migrate.handshake(s)
         h.pop("raw", None)
         grp = h.get("group") or "?"
@@ -316,7 +318,8 @@ def _cat(f):
     return {"certificate": "certificate", "dependency": "dependency", "config": "config"}.get(f["category"], "code")
 
 
-SIMULATORS = {"apps/probe.py", "apps/loadgen.py", "apps/legacy.py", "apps/legacy-openssl.cnf"}
+SIMULATORS = {"apps/probe.py", "apps/loadgen.py", "apps/legacy.py", "apps/legacy-openssl.cnf", "apps/clearing.py",
+              "runtime/conf/clearing.conf"}   # test harness, customer apps and the external partner
 
 
 def scan_estate(include_endpoints=True):

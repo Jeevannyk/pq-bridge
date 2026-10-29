@@ -14,7 +14,7 @@ A bank cannot switch every RSA/ECC dependency to post-quantum cryptography at on
 4. **Migrate** one change at a time: hybrid X25519+HQC key exchange, FN-DSA-512 certificates and JWTs, SLH-DSA root CA.
 5. **Prove** each change with a live verification gate, and **roll back** automatically or by hand if anything breaks.
 
-Everything runs against a real mini-bank in Docker, with continuous payment traffic and a legacy customer client.
+Everything runs against **PQBank**, a working bank in Docker: customers log in, get OAuth2 tokens, check balances and send money; a double-entry ledger keeps a signed audit trail; a KMS holds the signing keys; settlement files go to an external clearing house. Customer traffic never stops while we migrate.
 
 ---
 
@@ -22,13 +22,25 @@ Everything runs against a real mini-bank in Docker, with continuous payment traf
 
 | Piece | What it is | How it runs |
 |---|---|---|
-| **Mini-bank** (`testbed/`) | `gateway` (nginx, public), `card-auth` (issues JWTs), `payment-switch` (verifies JWTs, routes payments), `ledger` (SQLite). All service-to-service traffic uses mTLS. | Docker Compose project `pqbank`, Alpine 3.22, OpenSSL 3.5.9 + liboqs 0.16 + oqs-provider 0.12 |
-| **Load generator** | Sends payments through the gateway continuously (about 10/s). Counts every failure. | container `loadgen` |
-| **Legacy client** | A customer app that only speaks classical TLS and trusts only the RSA root. Probes once a second. | container `legacy` |
-| **Toolbox** | Issues certificates and runs the gate's real TLS handshakes and attack tests. | container `toolbox` |
-| **Console** | FastAPI backend and a multi-page web UI. | `.\dev.ps1` → http://127.0.0.1:8000 |
+| Node | What it does (real behaviour) | Crypto it uses (what we migrate) |
+|---|---|---|
+| **gateway** | Public API: TLS for customers, rate limiting, routes to the services over mTLS | public TLS (RSA cert, X25519), mTLS to identity / accounts / payments |
+| **identity** | Customer login (scrypt password hashes, lockout after 5 failures), OAuth2 access tokens (5 min) + rotating refresh tokens, JWKS | access-token signature (via KMS), JWKS publication, mTLS |
+| **accounts** | A customer's accounts and balances; needs a token with scope `accounts:read` | token verification (JWKS), mTLS, DB TLS |
+| **payments** | Transfers: scope `payments:write`, ownership check, **Idempotency-Key**, per-transfer and daily limits, fraud rule (large first payment to a new payee is held) | token verification, mTLS, DB TLS |
+| **ledger** | **Double-entry** books in one DB transaction (no overdraft), a **hash-chained audit log** signed per entry, idempotent per transfer | audit signature (via KMS), mTLS, DB TLS |
+| **kms** | Holds every signing key; signs only for the service authorised for that purpose (identity: tokens, ledger: audit, settlement: batches) | its own keys (RSA → FN-DSA / SLH-DSA), mTLS |
+| **settlement** | Every 30 s sends the clearing house a batch file of posted transfers, signed by the KMS | settlement signature, mTLS to the partner |
+| **postgres** | PostgreSQL 17, reachable only through an mTLS sidecar | DB TLS (nginx stream) |
+| **clearing** *(external partner)* | Verifies each batch against the bank keys it has been given; rejects anything else | trust in the bank's settlement key (we coordinate, we don't control it) |
+| **loadgen** | 20 customers' apps: login, refresh, balance checks, transfers, 3% retries with the same Idempotency-Key | public TLS |
+| **legacy** | An old customer app: classical TLS only, trusts only the RSA root | public TLS |
+| **toolbox** | Issues certificates and keys; runs the gate's real handshakes, attacks and business checks | — |
+| **Console** | FastAPI backend and multi-page web UI (`.\dev.ps1` → http://127.0.0.1:8000) | — |
 
-**Header bar (every page):** live payments settled, failed payments since boot, legacy client ok/fail, ledger transactions, the JWT algorithm in use, and QpiAI key status. Keep it visible: *"payments never stop while we migrate"* is the core claim.
+All service TLS is done by an **nginx sidecar** in each container (a service mesh): apps listen on localhost only, outbound HTTP calls go through a local mTLS egress, and SQL goes through an nginx **stream** mTLS tunnel to Postgres. So every TLS setting the migration changes lives in one rendered config per node.
+
+**Header bar (every page):** customer requests ok, failed requests since boot, legacy app ok/fail, transfers posted, the access-token algorithm in use, and QpiAI key status. Keep it visible: *"customers never notice the migration"* is the core claim.
 
 ---
 
@@ -63,9 +75,9 @@ Discover ─▶ Criticality ─▶ Prioritise (QpiAI Opt) ─▶ Migrate one cha
 | Find the mini-bank's vulnerabilities | 1 · Bank inventory | `pqbridge/scanner.py` → `detect.py` | The **hybrid engine** (rules + ML + verification) reads the mini-bank's code and nginx configs; X.509/PEM and dependency manifests are parsed exactly; plus a real `openssl s_client` handshake to each service |
 | How the detector was built | 2 · Detection engine | `pqbridge/detect.py` | **Trained and tested on 11 real bank / fintech repos** (read-only training data, not part of the migrated estate).  Rules, then an ML classifier (logistic regression on n-grams, path and banking context), then crypto verification (OpenSSL registry, RFC 7518, JCA names) |
 | Criticality | 4 · Criticality | `pqbridge/risk.py` | Mosca X+Y>Z urgency × exposure × criticality × evidence count, giving a risk score per service and per task |
-| Prioritise | 5 · Plan | `pqbridge/qubo.py` | Builds a HUBO (64 binaries, ~730 terms, 8 cubic terms). **QpiAI Opt** solves it multi-start; a validator checks every rule; CP-SAT (exact) and greedy are baselines; QAOA on QCloud re-checks one cluster |
+| Prioritise | 5 · Plan | `pqbridge/qubo.py` | 37 tasks × 4 windows = 148 binaries, pruned exactly to 82 (a task can only sit where its dependency chains allow), ~1,090 terms, 8 cubic. **QpiAI Opt** solves the whole HUBO natively, 16 starts; a validator checks every rule; CP-SAT (exact) and greedy are baselines; QAOA on QCloud re-checks one cluster |
 | Migrate | 7 · Migration control | `pqbridge/tasks.py`, `testbed.py` | A task changes the bank's crypto state. nginx configs are re-rendered and **gracefully reloaded** (no dropped connections); PKI tasks issue SLH-DSA / FN-DSA certs with QRNG-seeded keys |
-| Verify | 7 · Migration control | `pqbridge/migrate.py: run_gate` | 24 live checks: handshakes, compatibility, attacks, latency, payments |
+| Verify | 7 · Migration control | `pqbridge/migrate.py: run_gate` | about 64 live checks: handshakes on all 9 nodes, compatibility, business (login, transfer, money, audit, settlement), attacks, latency, payments |
 | Rollback | 7 · Migration control | `migrate.rollback`, `rollback_last` | Restores the previous crypto state and reloads; measures time until traffic is healthy |
 
 ---
@@ -109,7 +121,7 @@ The 11 real repos are **training and validation data only**. The engine on this 
 ### 4 · Criticality (risk), the manual criticality controls
 - An editable form with years to a quantum computer (Z), migration time (Y), and per-service data shelf-life (X), exposure and criticality.
 - **Re-score criticality** recomputes service and task risk.
-- **Demo:** set Z = 4 → card-auth becomes "at risk" and its tasks gain priority. Go to Plan → **Generate plan** and the windows reorder.
+- **Demo:** set Z = 4 → identity becomes "at risk" (credentials live 5 years) and its tasks gain priority. Go to Plan → **Generate plan** and the windows reorder.
 
 ### 5 · Plan (QpiAI Opt)
 - **Generate plan** builds the HUBO from the current task risks and solves it on QpiAI Opt (8 seeds, best feasible kept). It then validates the plan, compares it with CP-SAT and greedy, and runs QAOA on QCloud.
@@ -149,7 +161,7 @@ Four circuits built gate by gate with the QpiAI Quantum SDK. Each card has the d
 **c) Migration tasks: manual, one at a time.** Ordered by the QpiAI Opt plan window, then risk.
 - **Status:** `applied`, `ready` (prerequisites in effect) or `blocked` (prerequisite missing, shown in red).
 - **Apply** runs that one task, then the full gate. Promoted, or rolled back.
-- **Apply + prerequisites** (shown on blocked tasks) applies every missing prerequisite first, in order, each as its own gated change, then the task itself. One click on `cert.ledger` does `pki.pq-root → trust.payment-switch → cert.ledger`. It stops at the first failed step; earlier steps stay applied (use **Rollback last change** to undo them one at a time).
+- **Apply + prerequisites** (shown on blocked tasks) applies every missing prerequisite first, in order, each as its own gated change, then the task itself. One click on `cert.ledger` does `pki.pq-root → trust.kms → trust.payments → trust.postgres → cert.ledger`. It stops at the first failed step; earlier steps stay applied (use **Rollback last change** to undo them one at a time).
 - **Force** applies only that task, anyway, to show why order matters. Asks for confirmation. What you will see depends on the task:
   - certificate / trust tasks without the PQ PKI: the **pre-reload check** refuses ("`ledger.pq.crt` does not exist yet: apply `pki.pq-root` first"). Files are restored, the running bank is never touched, and the activity log shows a failed `preflight` check.
   - JWT / key-exchange order mistakes: real traffic breaks, the gate fails and rolls back (see the Fault scenarios).
@@ -160,24 +172,25 @@ Four circuits built gate by gate with the QpiAI Quantum SDK. Each card has the d
 
 | Scenario | What it does | Expected result |
 |---|---|---|
-| Public certificate switched before customers are ready | `cert.gateway-public`: gateway's public cert becomes FN-DSA | legacy client fails → gate ✗ "legacy customer client" → rollback ≈1 s; payments unaffected |
-| JWT issuer switched before verifiers accept FN-DSA | `jwt.sign-fndsa` before `jwt.dual-verify` | payments get 401 → gate ✗ "failed payments" → rollback ≈1.5 s |
-| Ledger forced to PQ-only before its client speaks HQC | `pqonly.ledger` before `kex.payment-switch` | ledger unreachable (502) → gate ✗ → rollback |
+| Public certificate switched before customers are ready | `cert.gateway-public`: gateway's public cert becomes FN-DSA | legacy app fails → gate ✗ "legacy customer client" → rollback ≈1 s; other customers unaffected |
+| Token signer switched before the APIs accept FN-DSA | `jwt.sign-fndsa` before `jwt.accept-*` | every API call 401 → gate ✗ "failed customer requests" → rollback |
+| Settlement signed with SLH-DSA before the clearing house trusts the key | `settle.sign-slhdsa` before `partner.clearing` | the partner rejects the batch → gate ✗ "settlement accepted" → rollback |
+| Database forced to PQ-only before its clients speak HQC | `pqonly.postgres` while some client is classical | logins and transfers fail → gate ✗ → rollback |
 
 **e) Planned waves.** The QpiAI Opt schedule as windows. **Run wave N** applies the whole window and gates it. **Run fault drill** = the public-certificate scenario.
 
 **f) Activity.** Every apply, gate run and rollback, newest first. Expand an entry to see every check, before/after handshake per service, bytes, p95 latency and trace links.
 
-#### The 24 gate checks
+#### The gate checks (about 64, all live)
 
-| Category | Check |
+| Category | Checks |
 |---|---|
-| trace (4) | real handshake per service: expected group (`X25519` / `x25519_hqc1` / `hqc1`) and signature (`rsa_pss_rsae_sha256` / `falcon512`); chain verifies |
-| compat (5) | a classical-only client still connects to each service (unless PQ-only is intended); legacy customer client keeps working |
-| negative (9) | forged JWT, `alg=none` JWT and expired-but-validly-signed JWT rejected; missing client cert and rogue self-signed client cert rejected on all 3 internal services; classical client refused by a PQ-only service |
-| overhead (4) | handshake p95 under 50 ms per service |
-| functional (1) | payments settled during the window |
-| availability (1) | **zero failed payments** during the window |
+| trace (9) | a real handshake to every node (incl. `postgres:5432` and the clearing house): expected group (`X25519` / `x25519_hqc1` / `hqc1`), signature (`rsa_pss_rsae_sha256` / `falcon512`), chain verifies |
+| compat (10) | a classical-only client still connects to each node (unless PQ-only is intended); the legacy customer app keeps working |
+| business (9) | login issues a token with the expected algorithm; JWKS publishes the expected keys; balances readable; a transfer posts and its audit entry is signed with the expected algorithm; a retry with the same Idempotency-Key is a replay; **money conserved**; **journal balanced**; **audit chain verifies**; **settlement batch accepted** by the clearing house with the expected algorithm |
+| negative (~25) | forged, `alg=none`, expired and foreign-issuer tokens; a token without `payments:write`; wrong password; paying from someone else's account; no Idempotency-Key; overdraft; an unauthorised service asking the KMS to sign or posting to the ledger; no client cert and a rogue self-signed cert on all 6 internal services and Postgres; classical client refused by a PQ-only node |
+| overhead (9) | handshake p95 under 50 ms per node |
+| functional / availability (2) | customer requests served, and **zero failed customer requests** during the change |
 
 ### 8 · Benchmarks
 Classical vs hybrid vs PQ-only on the same OpenSSL build.
@@ -213,16 +226,16 @@ Everything the backend did, with timestamps, including refused actions.
    
    Scroll down: "Tested on repositories it never saw in training: JPMorgan, AWS, Juspay and others, precision about 0.92, recall about 0.91."
 4. **TLS survey (30 s).** "21 of 24 banks already do PQ key exchange; none have PQ certificates."
-5. **Criticality (1 min).** Show the Mosca table. Change Z to 4 → *Re-score*. "card-auth is now at risk too." (Assumptions are saved. Set Z back to 8 and re-score after the demo.)
+5. **Criticality (1 min).** Show the Mosca table. Change Z to 4 → *Re-score*. "identity is now at risk too: customer credentials outlive the new quantum horizon." (Assumptions are saved. Set Z back to 8 and re-score after the demo.)
 6. **Plan (1.5 min).** *Generate plan.*
    - "QpiAI Opt solves the HUBO: 64 variables, with cubic terms for the blast radius."
    - Point to: feasible, beats greedy, gap to the exact optimum, the freeze respected, highest risk first.
 7. **QCloud circuits (1 min).** QRNG seeds our keys, QAOA cross-checks the plan, Shor factors 15, Grover justifies AES-256.
 8. **Migration control (4 min): the core.**
-   1. In *Migration tasks*, click **Apply** on `kex.gateway` (window 0, risk 10). Toast: ✓ 24/24 → promoted. Posture: gateway turns green `X25519+HQC-1`. Click **modern client** on gateway → `x25519_hqc1`; **classical client** → still `X25519`. Backward compatible.
-   2. **Apply** `pki.pq-root` (SLH-DSA root + FN-DSA leaves, QRNG-seeded) and `jwt.dual-verify`.
+   1. In *Migration tasks*, click **Apply** on `kex.gateway` (window 0, risk 10). Toast: ✓ all checks passed → promoted. Posture: gateway turns green `X25519+HQC-1`. Click **modern client** on gateway → `x25519_hqc1`; **classical client** → still `X25519`. Backward compatible.
+   2. **Apply + prerequisites** on `jwt.sign-fndsa`: one click runs `kms.key-jwt → jwt.publish → jwt.accept-accounts → jwt.accept-payments → jwt.sign-fndsa`, each gated. The header's "access-token alg" flips to FN-DSA-512 and customers keep transacting.
    3. Show that the order is enforced: **Apply** on a blocked task (e.g. `cert.ledger`) is refused, naming the missing prerequisite.
-   4. **Fault:** untick *Auto-rollback*. Trigger *Ledger forced to PQ-only…* (needs `kex.payment-switch` not yet applied). Watch failed payments rise in the header. The activity entry shows ✗. Click **Rollback last change**: restored in about 1 s, payments recover.
+   4. **Fault:** untick *Auto-rollback*. Trigger *Database forced to PQ-only…* (needs a DB client still classical). Watch failed payments rise in the header. The activity entry shows ✗. Click **Rollback last change**: restored in about 1 s, payments recover.
    5. Tick *Auto-rollback* again. Trigger *Public certificate switched before customers are ready*. The gate fails on the legacy client and rolls back automatically. Payments are untouched.
    6. **Run verification gate now**: all green on the current state.
    7. Optionally **Run wave N** for the rest of the plan, showing a full window promoted.
@@ -274,7 +287,8 @@ type testbed\runtime\conf\ledger.conf           # the nginx config the executor 
 - `testbed/runtime/state/services.json` holds each service's crypto posture: `kex`, `cert`, `trust`, and JWT settings.
 - A task (`pqbridge/tasks.py`) edits that state. PKI tasks also issue keys and certificates in the toolbox:
   - `pki.pq-root`: SLH-DSA-SHA2-128s root plus FN-DSA-512 leaves. Keys come from `openssl genpkey -rand <QRNG seed>`.
-  - `jwt.dual-verify`: issues the FN-DSA JWT key.
+  - `kms.key-jwt`, `kms.key-audit`, `kms.key-settlement`: create FN-DSA / SLH-DSA keys **inside the KMS** (no service ever sees them).
+  - `partner.clearing`: hands the clearing house the bank's new SLH-DSA settlement public key (a key ceremony with a partner).
 - `testbed.render_conf` regenerates the nginx config for each changed service (`ssl_ecdh_curve`, certificates, trust store, outbound `Groups`). It runs `nginx -t`, then `nginx -s reload`: a graceful reload, so in-flight connections finish.
 - JWT settings are read by the app on every request (no restart).
 - **Rollback** writes the previous state back and reloads the same services. New PKI files stay on disk; they are additive and harmless.
@@ -320,8 +334,8 @@ type testbed\runtime\conf\ledger.conf           # the nginx config the executor 
 | `pqbridge/risk.py` | Mosca risk model and editable assumptions |
 | `pqbridge/qubo.py` | HUBO formulation, QpiAI Opt multi-start, validator, CP-SAT and greedy baselines |
 | `pqbridge/qaoa.py`, `qrng.py`, `circuits.py` | QpiAI QCloud circuits |
-| `pqbridge/tasks.py` | Migration task catalogue (16 tasks + 1 deferred) and how each changes the bank |
-| `pqbridge/migrate.py` | Executor, 24-check verification gate, rollback, history, probes |
+| `pqbridge/tasks.py` | Migration task catalogue (37 tasks + 1 deferred), derived from the call graph in `config.py` |
+| `pqbridge/migrate.py` | Executor, verification gate (~64 checks), rollback, history, probes |
 | `pqbridge/testbed.py` | Docker control, PKI issuance, nginx rendering, graceful reload |
 | `pqbridge/bench.py`, `bench_tool.py` | Benchmarks |
 | `pqbridge/survey.py` | Public TLS survey |

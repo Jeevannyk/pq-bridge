@@ -18,8 +18,9 @@ RUN git clone --depth 1 -b ${OQSPROV_TAG} https://github.com/open-quantum-safe/o
 # Stage 2: one runtime image for every testbed node. OpenSSL 3.5 natively provides SLH-DSA (FIPS 205);
 # oqs-provider adds FN-DSA (Falcon) signatures and HQC key exchange to TLS for nginx, python and the CLI.
 FROM alpine:3.22
-RUN apk add --no-cache openssl nginx python3 \
- && mkdir -p /run/nginx /data /usr/lib/ossl-modules
+RUN apk add --no-cache openssl nginx nginx-mod-stream python3 py3-psycopg postgresql17 postgresql17-client \
+ && mkdir -p /run/nginx /run/postgresql /data /usr/lib/ossl-modules \
+ && chown postgres:postgres /run/postgresql
 COPY --from=oqs /oqsprovider.so /usr/lib/ossl-modules/oqsprovider.so
 COPY openssl-oqs.cnf /etc/ssl/openssl-oqs.cnf
 ENV OPENSSL_CONF=/etc/ssl/openssl-oqs.cnf

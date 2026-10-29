@@ -1,12 +1,14 @@
 """Wave executor + verification gate + automatic rollback.
 
-A wave is promoted only if every gate check passes:
-  trace        real TLS handshake per service: expected group / signature / chain
-  compat       legacy client and classical-only probes still connect (unless PQ-only is intended)
-  functional   payments keep settling, ledger keeps posting
-  negative     forged / alg=none / expired JWTs and missing / rogue client certs are rejected
+A change is promoted only if every gate check passes:
+  trace        real TLS handshake per node (incl. postgres:5432 and the clearing house): expected group / signature / chain
+  compat       classical-only clients still connect (unless PQ-only is intended); legacy customer app still works
+  business     login issues tokens with the expected algorithm, JWKS, accounts, a transfer posts and its retry is a
+               replay, money conserved, journal balanced, audit chain verifies, settlement accepted by the clearing house
+  negative     forged / alg=none / expired / foreign-issuer / under-scoped tokens, someone else's account, overdraft,
+               missing Idempotency-Key, unauthorised KMS and ledger calls, missing or rogue client certs: all refused
   overhead     handshake p95 within budget
-  availability zero failed payments during the wave
+  availability zero failed customer requests during the change
 Otherwise the previous configuration is restored and the rollback time is recorded.
 """
 import copy
@@ -28,8 +30,9 @@ def _ca():
 def handshake(svc, groups=None):
     """Real openssl s_client handshake from the toolbox. Returns parsed facts + raw trace."""
     g = f"-groups {groups} " if groups else ""
+    port = 5432 if svc == "postgres" else 443
     out = testbed.tool(
-        _ca() + f"echo | timeout 10 openssl s_client -connect {svc}:443 -servername {svc} -CAfile $CA "
+        _ca() + f"echo | timeout 10 openssl s_client -connect {svc}:{port} -servername {svc} -CAfile $CA "
         f"-cert /pki/certs/probe.rsa.crt -key /pki/certs/probe.rsa.key {g}-trace 2>&1", check=False).stdout
 
     def find(rx):
@@ -76,8 +79,18 @@ def timing(svc, n=20):
 
 
 def negative_tests():
-    out = testbed.tool("python3 /apps/probe.py negative", check=False, timeout=180).stdout
+    out = testbed.tool("python3 /apps/probe.py negative", check=False, timeout=240).stdout
     return json.loads(out.strip().splitlines()[-1])
+
+
+def business_tests(st):
+    exp = {"jwt_alg": st["identity"]["jwt_alg"], "jwt_publish": st["identity"]["jwt_publish"],
+           "audit_alg": st["ledger"]["audit_alg"], "settle_alg": st["settlement"]["settle_alg"]}
+    out = testbed.tool(f"python3 /apps/probe.py business '{json.dumps(exp)}'", check=False, timeout=240).stdout
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except Exception:
+        return [{"case": "business checks ran", "passed": False, "detail": out[-300:]}]
 
 
 def _counts(tr):
@@ -108,8 +121,10 @@ def run_gate(st, pre, label):
             add("compat", f"{svc}: classical-only client still connects", legacy_h["ok"],
                 f"negotiated {legacy_h['group']}")
 
+    for c in business_tests(st):
+        add("business", c["case"], c["passed"], c["detail"])
     for c in negative_tests():
-        add("negative", f"{c['target']}: {c['case']} rejected", c["rejected"], f"{c['result']} {c['detail']}")
+        add("negative", f"{c['target']}: {c['case']} refused", c["rejected"], c["detail"])
 
     times = {s: timing(s) for s in testbed.ROLES}
     for s, t in times.items():
@@ -120,9 +135,9 @@ def run_gate(st, pre, label):
     d = {k: post[k] - pre[k] for k in post}
     add("compat", f"legacy customer client: {d['legacy_ok']} ok / {d['legacy_fail']} failed",
         d["legacy_fail"] == 0 and d["legacy_ok"] > 0)
-    add("functional", f"payments settled during wave: {d['pay_ok']}", d["pay_ok"] > 0,
-        f"ledger posted {d['ledger_tx']} tx")
-    add("availability", f"failed payments during wave: {d['pay_fail']}", d["pay_fail"] == 0)
+    add("functional", f"customer requests served during the change: {d['pay_ok']}", d["pay_ok"] > 0,
+        f"ledger posted {d['ledger_tx']} transfers")
+    add("availability", f"failed customer requests during the change: {d['pay_fail']}", d["pay_fail"] == 0)
     return checks, after, times, d
 
 
@@ -158,27 +173,17 @@ def _push_history(label, task_ids, pre_state):
 
 
 def task_done(task_id, st):
-    """Derive whether a migration task is in effect from the live crypto state."""
-    kind, svc = task_id.split(".", 1)
-    if task_id == "pki.pq-root":
-        return st["_pki"]["pq_root"]
-    if task_id == "jwt.dual-verify":
-        return config.PQ["jwt_alg"] in st["payment-switch"].get("jwt_accept", [])
-    if task_id == "jwt.sign-fndsa":
-        return st["card-auth"].get("jwt_alg") == config.PQ["jwt_alg"]
-    if task_id == "cert.gateway-public":
-        return st["gateway"]["public_cert"] == "pq"
-    return {"trust": st[svc]["trust"] == "both" if svc in st else False,
-            "kex": st[svc]["kex"] in ("hybrid", "pq-only") if svc in st else False,
-            "pqonly": st[svc]["kex"] == "pq-only" if svc in st else False,
-            "cert": st[svc]["cert"] == "pq" if svc in st else False}.get(kind, False)
+    """Whether a migration task is in effect, from the live crypto state and the key material on disk."""
+    t = tasks.TASK_BY_ID.get(task_id) or (tasks.DEFERRED_TASK if task_id == tasks.DEFERRED_TASK["id"] else None)
+    return bool(t) and tasks.done(t, st)
 
 
 def run_wave(index, task_ids, label=None, log=print, auto_rollback=True):
     label = label or f"wave{index}"
     pre_state = testbed.read_state()
     pre = _counts(testbed.traffic())
-    touched = sorted({tasks.TASK_BY_ID.get(t, {"service": "gateway"})["service"] for t in task_ids} & set(testbed.ROLES))
+    defs = [tasks.TASK_BY_ID.get(t) or tasks.DEFERRED_TASK for t in task_ids]
+    touched = sorted({svc for d in defs for svc in list(d["sets"]) + list(d["adds"])} & set(testbed.ROLES))
     before = capture_traces(label + "-before", touched or testbed.ROLES)
     log(f"[{label}] applying {task_ids}")
 
