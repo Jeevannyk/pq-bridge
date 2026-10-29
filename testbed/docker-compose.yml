@@ -1,6 +1,6 @@
 name: pqbank
 
-# PQBank: 8 bank services + 1 external partner + 2 customer apps + the operator toolbox.
+# PQBank: 8 bank services + 1 external partner + the legacy customer app + the operator toolbox.
 # Signing keys live in runtime/kms and are mounted into the kms container only (and the toolbox, which issues them).
 
 x-node: &node
@@ -87,16 +87,12 @@ services:
     <<: *node
     command: ["gateway"]
     ports: ["8443:443"]
-    volumes: *svcvols
-    depends_on: [identity, accounts, payments]
-
-  loadgen:
-    <<: *node
-    command: ["loadgen"]
     volumes:
       - ./runtime/pki:/pki:ro
-      - ./runtime/state:/state
-    depends_on: [gateway]
+      - ./runtime/state:/state:ro
+      - ./runtime/conf:/conf:ro
+      - ../netbank/frontend:/netbank:ro
+    depends_on: [identity, accounts, payments]
 
   legacy:
     <<: *node

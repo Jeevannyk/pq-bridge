@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import config
 from .config import CONF, GROUPS, INITIAL_STATE, PKI, PQ, RUNTIME, STATE, TESTBED
@@ -75,6 +76,12 @@ def _seed_file(label, seed_hex):
     return f"printf '{seed_hex}' | python3 -c 'import sys;sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))' > /tmp/q_{label}.bin"
 
 
+def _parallel(snippets):
+    """One shell command that runs every snippet at the same time and fails if any of them fails."""
+    jobs = "".join(f"( {s} ) & pids=\"$pids $!\"; " for s in snippets)
+    return f"pids=''; {jobs}fail=0; for p in $pids; do wait $p || fail=1; done; [ $fail = 0 ]"
+
+
 def _leaf(name, alg, seed=None):
     """Shell snippet: key + CSR + cert for one identity, signed by the matching root."""
     san = f"DNS:{name}" + (",DNS:localhost" if name == "gateway" else "")
@@ -98,9 +105,9 @@ def pki_init():
         "cd /pki && mkdir -p certs trust",
         "openssl req -x509 -newkey rsa:2048 -nodes -keyout rsa-root.key -out rsa-root.crt "
         f"-subj '/CN=PQBank RSA Root CA' -days 365 {CA_EXT} 2>/dev/null",
-        *[_leaf(n, "rsa") for n in IDENTITIES],
-        *[f"openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /kms/{p}.rsa.key && "
-          f"openssl pkey -in /kms/{p}.rsa.key -pubout -out /kms/{p}.rsa.pub" for p in KMS_PURPOSES],
+        _parallel([*[_leaf(n, "rsa") for n in IDENTITIES],
+                   *[f"openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /kms/{p}.rsa.key && "
+                     f"openssl pkey -in /kms/{p}.rsa.key -pubout -out /kms/{p}.rsa.pub" for p in KMS_PURPOSES]]),
         "cp /kms/settlement.rsa.pub /clearing-trust/settlement-rsa.pem",
         "cp rsa-root.crt trust/rsa.pem && cp rsa-root.crt trust/client-trust.pem",
         "chmod -R a+r /pki /clearing-trust",
@@ -115,7 +122,7 @@ def pki_issue_pq(seeds):
         f"{_seed_file('root', seeds['root'])} && openssl genpkey -algorithm {PQ['root_sig']} "
         "-rand /tmp/q_root.bin -out pq-root.key",
         f"openssl req -x509 -new -key pq-root.key -subj '/CN=PQBank SLH-DSA Root CA' -days 3650 {CA_EXT} -out pq-root.crt",
-        *[_leaf(n, "pq", seeds[n]) for n in IDENTITIES],
+        _parallel([_leaf(n, "pq", seeds[n]) for n in IDENTITIES]),
         "cat rsa-root.crt pq-root.crt > trust/both.tmp && mv trust/both.tmp trust/both.pem",
         "cp trust/both.pem trust/ct.tmp && mv trust/ct.tmp trust/client-trust.pem",
         "chmod -R a+r /pki",
@@ -142,6 +149,14 @@ def clearing_trust_key(purpose, tag):
 
 
 # ------------------------------------------------------------------ nginx ----
+# While a change is applied a hop can refuse or miss a connection. Answer with JSON 503 (which NetBank retries quietly)
+# instead of nginx's HTML 400/502 page, which a customer would see as "Request failed".
+BUSY_MSG = "PQBank is applying a security update. Please try again in a moment."
+BUSY_JSON = '{"error":"' + BUSY_MSG + '","retry":true}'
+GATEWAY_BUSY = f"error_page 502 503 504 = @bank_busy; location @bank_busy {{ default_type application/json; return 503 '{BUSY_JSON}'; }}"
+SIDECAR_BUSY = f"error_page 495 496 497 = @tls_refused; location @tls_refused {{ default_type application/json; return 503 '{BUSY_JSON}'; }}"
+
+
 def _out_groups(svc_state):
     # A PQ-enabled client must also offer the pure PQ group, or it cannot reach a PQ-only peer.
     return f"{GROUPS['hybrid']}:{PQ['pq_group']}" if svc_state["kex"] != "classical" else GROUPS["classical"]
@@ -161,13 +176,15 @@ def _client_tls(name, s, target, prefix="proxy_"):
       {prefix}ssl_conf_command Groups {_out_groups(s)};"""
 
 
-def _proxy(name, s, target, strip=True):
+def _proxy(name, s, target, strip=True, read_timeout=None):
     up = target.replace("-", "_")
     # A request landing on a peer mid-reload is retried; payments/ledger are idempotent on transfer ids.
+    rt = f"\n      proxy_read_timeout {read_timeout}s;" if read_timeout else ""
     return f"""
       proxy_pass https://{up}{'/' if strip else ''};
       proxy_set_header Host {target};
-      proxy_next_upstream error timeout http_502 non_idempotent;
+      proxy_connect_timeout 3s;{rt}
+      proxy_next_upstream error timeout http_502 http_503 non_idempotent;
       proxy_next_upstream_tries 3;{_client_tls(name, s, target)}"""
 
 
@@ -194,22 +211,37 @@ def render_conf(name, st):
 
     if name == "gateway":
         r = lambda t, strip=False: _proxy(name, s, t, strip)
+        pay = lambda: _proxy(name, s, "payments", False, read_timeout=75)    # a payment may wait out a rollback inside the bank
         out.append(f"""http {{
   access_log off;
+  log_format cust 'CUST $msec $status $request_method $uri "$http_user_agent"';
+  include /etc/nginx/mime.types;
   limit_req_zone $binary_remote_addr zone=api:10m rate=300r/s;
 {upstreams}
   server {{
     listen 443 ssl;
     server_name gateway localhost;
     ssl_protocols TLSv1.2 TLSv1.3;{_server_tls(name, s, cert=s['public_cert'], verify_client=False)}
+    {GATEWAY_BUSY}
     location = /health {{ default_type application/json; return 200 '{{"ok":true}}'; }}
-    location /oauth/ {{ limit_req zone=api burst=600 nodelay;{r('identity')}
+    location /oauth/ {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{r('identity')}
     }}
     location = /.well-known/jwks.json {{{r('identity')}
     }}
-    location /api/accounts {{ limit_req zone=api burst=600 nodelay;{r('accounts')}
+    location /api/auth/ {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{r('identity')}
     }}
-    location /api/payments/ {{ limit_req zone=api burst=600 nodelay;{r('payments')}
+    location /api/accounts {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{r('accounts')}
+    }}
+    location /api/payments/ {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{pay()}
+    }}
+    location = /favicon.ico {{ return 204; }}
+    location / {{
+      root /netbank;
+      index index.html;
+      add_header Cache-Control "no-store" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-Frame-Options "DENY" always;
+      add_header Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'" always;
     }}
   }}
 }}
@@ -225,6 +257,7 @@ def render_conf(name, st):
     listen 443 ssl;
     server_name {name};
     ssl_protocols TLSv1.3;{_server_tls(name, s)}
+    {SIDECAR_BUSY}
     location / {{
       proxy_pass http://127.0.0.1:8000;
       proxy_set_header X-Client-CN $ssl_client_s_dn;
@@ -271,17 +304,33 @@ def reload(name):
 
 def apply_state(st, changed):
     write_state(st)
-    write_confs(st, only=[c for c in changed if c in ROLES])
-    for c in changed:
-        if c in ROLES:
-            reload(c)
+    roles = [c for c in changed if c in ROLES]
+    write_confs(st, only=roles)
+    with ThreadPoolExecutor(max_workers=max(1, len(roles))) as ex:      # independent containers: reload side by side
+        for f in [ex.submit(reload, c) for c in roles]:
+            f.result()
 
 
 # ------------------------------------------------------------- lifecycle ----
+BUILD_STAMP = TESTBED / ".build-stamp"
+BUILD_SOURCES = ["Dockerfile", "apps", "openssl-oqs.cnf", "start.sh"]
+
+
+def _needs_build():
+    """The apps are baked into the image, so rebuild when any of them is newer than the last build (or the image is gone)."""
+    if not BUILD_STAMP.exists() or run(["docker", "image", "inspect", "pqbridge-node:latest"], check=False).returncode != 0:
+        return True
+    files = [f for s in BUILD_SOURCES for f in ([TESTBED / s] if (TESTBED / s).is_file() else (TESTBED / s).rglob("*"))
+             if f.is_file() and "__pycache__" not in f.parts]
+    return any(f.stat().st_mtime > BUILD_STAMP.stat().st_mtime for f in files)
+
+
 def up():
     for d in (PKI, STATE, CONF, RUNTIME / "evidence", KMS, CLEARING_TRUST):
         d.mkdir(parents=True, exist_ok=True)
-    compose("build", timeout=3600)        # first build compiles liboqs; slow laptops need well over 15 min
+    if _needs_build():
+        compose("build", timeout=3600)    # first build compiles liboqs; slow laptops need well over 15 min
+        BUILD_STAMP.touch()
     compose("up", "-d", "toolbox")
     if not (PKI / "rsa-root.crt").exists():
         pki_init()
@@ -293,17 +342,21 @@ def up():
 
 
 def wait_healthy(timeout=240):
+    """The bank is up when a customer can sign in and read their accounts through the public gateway."""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        lg = read_json("loadgen.json")
-        if lg.get("ok", 0) > 5:
-            return True
-        time.sleep(2)
+        p = tool("python3 /apps/probe.py canary", check=False, timeout=60)
+        try:
+            if json.loads(p.stdout.strip().splitlines()[-1]).get("ok"):
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
     raise RuntimeError("the bank did not start serving customers; check `docker compose -f testbed/docker-compose.yml logs`")
 
 
 def down(wipe=False):
-    compose("down", "-v" if wipe else "--remove-orphans", check=False)
+    compose("down", "-t", "0" if wipe else "5", *(["-v"] if wipe else []), "--remove-orphans", check=False)   # wiping: nothing to shut down gracefully
     if wipe and RUNTIME.exists():
         shutil.rmtree(RUNTIME)
 
@@ -317,4 +370,29 @@ def ledger_stats():
 
 
 def traffic():
-    return {"payments": read_json("loadgen.json"), "legacy": read_json("legacy.json"), "ledger": ledger_stats()}
+    return {"legacy": read_json("legacy.json"), "ledger": ledger_stats()}
+
+
+def customer_traffic(since):
+    """What real customers got from the gateway since `since` (epoch seconds), read from its access log.
+    The gate's own probe (User-Agent pqbridge-probe) is not a customer and is left out."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since - 1))
+    p = compose("logs", "gateway", "--no-log-prefix", "--since", stamp, check=False, timeout=60)
+    n = errors = payments = 0
+    failed = {}
+    for line in p.stdout.splitlines():
+        parts = line.split(" ", 5)
+        if len(parts) < 6 or parts[0] != "CUST":
+            continue
+        try:
+            ts, status = float(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if ts < since or "pqbridge-probe" in parts[5]:
+            continue
+        n += 1
+        payments += parts[3] == "POST" and parts[4].startswith("/api/payments/")
+        if status >= 500:
+            errors += 1
+            failed[f"{status} {parts[3]} {parts[4]}"] = failed.get(f"{status} {parts[3]} {parts[4]}", 0) + 1
+    return {"requests": n, "payments": payments, "errors_5xx": errors, "failed": failed}

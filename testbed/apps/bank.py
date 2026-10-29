@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 STATE_FILE = "/state/services.json"
 EGRESS = "http://127.0.0.1:9001"
@@ -104,6 +105,17 @@ def egress(method, path, body=None, headers=None, timeout=10):
 def db():
     import psycopg
     return psycopg.connect(DB_DSN)
+
+
+def transient(e):
+    """True for connection-level failures (peer or database unreachable, timeout), not for bugs."""
+    if isinstance(e, (OSError, urllib.error.URLError, TimeoutError)):
+        return True
+    try:
+        import psycopg
+        return isinstance(e, psycopg.OperationalError)
+    except ImportError:
+        return False
 
 
 # ------------------------------------------------------------------ KMS client
@@ -195,6 +207,17 @@ class Handler(BaseHTTPRequestHandler):
             return dict(parse_qsl(raw.decode()))
         return json.loads(raw or b"{}")
 
+    def query(self):
+        return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+
+    def auth(self, role, scope):
+        """Verify the bearer token for this service; on failure the error reply is already sent and None is returned."""
+        ok, claims, code = verify_access_token(self.headers.get("Authorization", ""), state(role)["jwt_accept"], scope)
+        if not ok:
+            self.reply(code, {"error": claims})
+            return None
+        return claims
+
     def client_cn(self):
         dn = self.headers.get("X-Client-CN", "")
         for part in dn.replace("/", ",").split(","):
@@ -212,6 +235,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             getattr(self, name)()
         except Exception as e:                    # never leak a stack trace to a client
+            if transient(e):                      # a peer or the database is briefly unreachable: callers should retry
+                return self.reply(503, {"error": "temporarily unavailable, retry"})
             self.reply(500, {"error": f"{type(e).__name__}: {str(e)[:200]}"})
 
     def do_GET(self):

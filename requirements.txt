@@ -5,6 +5,8 @@ cryptography
 scipy
 numpy
 fastapi
+reportlab
+requests
 uvicorn[standard]
 scikit-learn
 pandas

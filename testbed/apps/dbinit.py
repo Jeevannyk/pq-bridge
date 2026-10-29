@@ -23,10 +23,26 @@ CREATE TABLE IF NOT EXISTS batches(id BIGSERIAL PRIMARY KEY, created DOUBLE PREC
   kid TEXT, status TEXT, reason TEXT);
 CREATE TABLE IF NOT EXISTS seed_total(total BIGINT NOT NULL);
 CREATE INDEX IF NOT EXISTS transfers_unsettled ON transfers(status, batch_id);
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS full_name TEXT;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS phone TEXT;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_login DOUBLE PRECISION;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'Savings';
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS memo TEXT;
+CREATE TABLE IF NOT EXISTS payees(customer_id TEXT NOT NULL, account_id TEXT NOT NULL, nickname TEXT NOT NULL,
+  added DOUBLE PRECISION NOT NULL, PRIMARY KEY(customer_id, account_id));
+CREATE INDEX IF NOT EXISTS journal_account ON journal(account_id, id);
 """
-# 20 everyday customers (used by the customer app), one low-balance customer and one test customer for the gate.
-CUSTOMERS = [(f"cust{i:03d}", f"Passw0rd!{i:03d}", 1_000_000_00) for i in range(1, 21)] + \
-            [("cust099", "Passw0rd!099", 100_00), ("gatetest", "Gate-Test-Pass-1", 1_000_000_00)]
+# The only seeded accounts are the verification gate's: a payer, a counterparty and a low-balance account for the
+# overdraft check. They are automated, never people, and are excluded from the dashboard's customer figures.
+# Real customers (DEMO, below) are the only ones who generate bank activity.
+CUSTOMERS = [("gatetest", "Gate-Test-Pass-1", 1_000_000_00), ("gatepeer", "Gate-Peer-Pass-1", 1_000_000_00),
+             ("gatepoor", "Gate-Poor-Pass-1", 100_00)]
+NAMES = ["Verification gate payer", "Verification gate counterparty", "Verification gate low-balance account"]
+# Named customers for hands-on use of the NetBank web app: a savings and a current account each.
+DEMO = [("vamsh", "vamsh", "Vamsh Rai", 500_000_00, 50_000_00),
+        ("rahul", "Rahul#Bank2026", "Rahul Verma", 300_000_00, 25_000_00),
+        ("meera", "Meera#Bank2026", "Meera Iyer", 750_000_00, 100_000_00)]
 
 
 def scrypt(pw, salt):
@@ -60,6 +76,21 @@ def main():
                 total += bal
             c.execute("INSERT INTO seed_total VALUES (%s)", (total,))
             c.execute("INSERT INTO audit_head VALUES (0, %s)", ("0" * 64,))
+        for (user, _, _), name in zip(CUSTOMERS, NAMES):
+            c.execute("UPDATE customers SET full_name=%s, email=COALESCE(email, %s) WHERE username=%s",
+                      (name, f"{user}@pqbank.example", user))
+        for user, pw, name, savings, current in DEMO:
+            if c.execute("SELECT 1 FROM customers WHERE username=%s", (user,)).fetchone():
+                continue
+            n = c.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+            a = c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+            salt = os.urandom(16)
+            cid = f"C{n + 1:04d}"
+            c.execute("INSERT INTO customers(id, username, pw_hash, pw_salt, full_name, email, phone) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                      (cid, user, scrypt(pw, salt), salt.hex(), name, f"{user}@pqbank.example", f"+91 98{n:08d}"))
+            for k, (kind, bal) in enumerate([("Savings", savings), ("Current", current)]):
+                c.execute("INSERT INTO accounts(id, customer_id, balance, type) VALUES (%s,%s,%s,%s)", (f"ACC-{a + k + 1:04d}", cid, bal, kind))
+            c.execute("UPDATE seed_total SET total = total + %s", (savings + current,))
     print("bank database ready", flush=True)
 
 

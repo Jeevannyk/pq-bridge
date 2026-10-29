@@ -36,5 +36,8 @@ while True:
     stats["updated"] = time.time()
     with open(OUT + ".tmp", "w") as f:
         json.dump(stats, f)
-    os.replace(OUT + ".tmp", OUT)
+    try:
+        os.replace(OUT + ".tmp", OUT)
+    except PermissionError:                       # the host file is briefly locked (OneDrive / Windows): retry next second
+        pass
     time.sleep(1)

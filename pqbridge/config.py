@@ -27,6 +27,10 @@ QPIAI_OPT_API_KEY = os.environ.get("QPIAI_OPT_API_KEY")
 QCLOUD_API_KEY = os.environ.get("QCLOUD_API_KEY")
 # QpiAI-QSV-Local runs the QpiAI simulator in-process; set QCLOUD_DEVICE to a cloud device to use QCloud.
 QCLOUD_DEVICE = os.environ.get("QCLOUD_DEVICE", "QpiAI-QSV-Local")
+# The two showcase circuits (QRNG, QAOA ansatz) run once on this device. QpiAI-QSV-Local runs in-process (no
+# subscription); set a cloud device such as QpiAI-QSV-Lite once the QCloud account has an active subscription.
+CIRCUIT_DEVICE = os.environ.get("QCLOUD_CIRCUIT_DEVICE", "QpiAI-QSV-Local")
+QCLOUD_EXPERIMENT = os.environ.get("QCLOUD_EXPERIMENT", "Default Experiment")   # QCloud jobs need an existing experiment
 
 # The bank. Values feed the risk model (Module 2).
 #   shelf_life_years: how long data protected by this service must stay confidential

@@ -33,6 +33,9 @@ class Ledger(bank.Handler):
             done = conn.execute("SELECT seq, alg, kid FROM audit_log WHERE transfer_id=%s", (tid,)).fetchone()
             if done:                                                                   # retried request: post once
                 return self.reply(200, {"transfer_id": tid, "audit_seq": done[0], "alg": done[1], "kid": done[2], "replayed": True})
+            closed = conn.execute("SELECT status FROM transfers WHERE id=%s", (tid,)).fetchone()
+            if closed and closed[0] == "rejected":                                     # payments told the customer it failed
+                return self.reply(422, {"error": "payment was already failed; not posting"})
             bal = dict(conn.execute("SELECT id, balance FROM accounts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
                                     ([src, dst],)).fetchall())
             if len(bal) != 2:

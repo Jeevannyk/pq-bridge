@@ -1,18 +1,15 @@
-"""QpiAI QCloud circuit designs used by PQ-Bridge.
+"""QpiAI QCloud circuit designs used by PQ-Bridge (both fit the 6-qubit free tier).
 
-  qrng    16-qubit H+measure entropy source -> seeds for FN-DSA / SLH-DSA keys (decision input)
-  qaoa    QAOA ansatz for the migration-schedule cluster sub-QUBO (decision input)
-  shor    Shor period finding for N=15 (threat evidence: why RSA/ECC must go; context only)
-  grover  Grover key search on a 4-bit toy cipher (why AES-256 / SHA-384 in the migration policy; context only)
+  qrng    6-qubit H+measure entropy source -> seeds for FN-DSA / SLH-DSA keys
+  qaoa    QAOA ansatz for the migration-schedule cluster sub-QUBO (settlement rollout)
 
-Each design is built gate-by-gate with the QpiAI Quantum SDK and exported as OpenQASM 2.0 with a
-rendered diagram. It is then run on QCLOUD_DEVICE and its metrics (qubits, depth, gate counts) and
-results are recorded in evidence/circuits/.
-    python -m pqbridge.circuits            design + run all four
+Each design is built gate-by-gate with the QpiAI Quantum SDK, exported as OpenQASM 2.0, drawn by the
+SDK's own renderer, and run once on CIRCUIT_DEVICE (QpiAI QCloud). Metrics (qubits, depth, gate counts)
+and results are recorded in evidence/circuits/.
+    python -m pqbridge.circuits            design + run both
     python -m pqbridge.circuits --devices  list QCloud compute resources (needs QCLOUD_API_KEY)
 """
 import json
-import math
 import os
 import re
 import sys
@@ -80,7 +77,7 @@ def _record(name, circuit, purpose, role, run=None, extra=None):
     rec = {"name": name, "purpose": purpose, "role": role, "qubits": circuit.num_qubits,
            "clbits": circuit.num_clbits, "depth": circuit.depth(), "size": circuit.size(),
            "gates": _gate_counts(qasm), "qasm": f"{name}.qasm", "diagram": _render(circuit, name),
-           "device": config.QCLOUD_DEVICE, **(run or {}), **(extra or {})}
+           "device": config.CIRCUIT_DEVICE, **(run or {}), **(extra or {})}
     (OUT / f"{name}.json").write_text(json.dumps(rec, indent=1))
     return rec
 
@@ -88,17 +85,24 @@ def _record(name, circuit, purpose, role, run=None, extra=None):
 def _run(circuit, shots, name):
     _login()
     t0 = time.time()
-    r = circuit.run(shots=shots, experiment_name=f"pqbridge-{name}", device_name=config.QCLOUD_DEVICE)
+    device, cloud_error = config.CIRCUIT_DEVICE, None
+    try:
+        r = circuit.run(shots=shots, experiment_name=config.QCLOUD_EXPERIMENT, device_name=device)
+    except Exception as e:                      # e.g. account without an active QCloud subscription
+        cloud_error = next((l.strip() for l in str(e).splitlines() if "error" in l.lower() and "Server response" in l), str(e).splitlines()[0])[:200]
+        device = "QpiAI-QSV-Local"
+        r = circuit.run(shots=shots, experiment_name=config.QCLOUD_EXPERIMENT, device_name=device)
     counts = r.get_counts()
     top = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:8])
-    return {"shots": shots, "job_id": getattr(r, "job_id", None), "run_s": round(time.time() - t0, 3),
+    return {"device": device, "cloud_error": cloud_error, "shots": shots, "job_id": getattr(r, "job_id", None), "run_s": round(time.time() - t0, 3),
             "distinct_outcomes": len(counts), "top_counts": top}, counts
 
 
 # ------------------------------------------------------------------ designs
-def qrng(n=16, shots=256):
+def qrng(shots=256):
     from qpiai_quantum import Circuit
     from . import qrng as Q
+    n = Q.N_QUBITS
     c = Circuit(n, n)
     for q in range(n):
         c.h(q)
@@ -127,64 +131,9 @@ def qaoa():
                                            "qaoa_best_energy": q.get("qaoa_best", {}).get("energy")})
 
 
-def shor(N=15, a=7, precision=4):
-    from qpiai_quantum import ShorsAlgorithm
-    s = ShorsAlgorithm(N)
-    c = s.build_circuit(a, precision)
-    run, counts = _run(c, 1024, "shor")
-    t0 = time.time()
-    factors = s.factor(max_attempts=10)
-    phases = []
-    for bitstr, k in sorted(counts.items(), key=lambda kv: -kv[1])[:6]:
-        meas = int(bitstr[-precision:], 2) if len(bitstr) >= precision else int(bitstr, 2)
-        phases.append({"outcome": bitstr, "count": k, "phase": round(meas / 2 ** precision, 4)})
-    return _record("shor", c, f"Shor period finding: factor N={N} with a={a} ({precision} counting qubits)",
-                   "threat evidence (context only)", run,
-                   {"N": N, "a": a, "factors_found": list(factors) if factors else None,
-                    "factor_s": round(time.time() - t0, 3), "top_phases": phases,
-                    "scale_note": "RSA-2048 is estimated to need under one million noisy qubits for under a week "
-                                  "(Gidney, 2025). A CRQC breaks every RSA/ECC key in this bank, which is why the "
-                                  "inventory treats them as quantum-vulnerable."})
-
-
-TOY_SBOX = [0xC, 0x5, 0x6, 0xB, 0x9, 0x0, 0xA, 0xD, 0x3, 0xE, 0xF, 0x8, 0x4, 0x7, 0x1, 0x2]   # PRESENT S-box
-
-
-def toy_encrypt(p, k):
-    return TOY_SBOX[p ^ k] ^ k
-
-
-def grover(n=4):
-    from qpiai_quantum import GroverSearch
-    secret = 0b1011
-    # choose a known plaintext whose ciphertext pins down a unique key
-    p = next(x for x in range(2 ** n)
-             if sum(toy_encrypt(x, k) == toy_encrypt(x, secret) for k in range(2 ** n)) == 1)
-    ct = toy_encrypt(p, secret)
-    keys = [k for k in range(2 ** n) if toy_encrypt(p, k) == ct]
-    target = format(keys[0], f"0{n}b")
-    g = GroverSearch(n, target)
-    c = g.build_circuit()
-    run, counts = _run(c, 1024, "grover")
-    k_opt = math.floor(math.pi / 4 * math.sqrt(2 ** n))
-    # GroverSearch takes the target with qubit 0 leftmost; counts are little-endian (qubit 0 rightmost)
-    hit = counts.get(target[::-1], 0) / 1024
-    return _record("grover", c, "Grover key search on a 4-bit toy cipher (PRESENT S-box, known plaintext/ciphertext)",
-                   "policy evidence (context only)", run,
-                   {"plaintext": p, "ciphertext": ct, "consistent_keys": keys, "target": target,
-                    "optimal_iterations": k_opt, "measured_success": round(hit, 4),
-                    "predicted_success": round(g.get_success_probability(), 4),
-                    "classical_expected_tries": 2 ** n / 2,
-                    "scale_note": "Grover needs ~pi/4*2^(n/2) sequential AES evaluations: ~2^64 for AES-128 and "
-                                  "~2^128 for AES-256. A full AES-128 oracle needs thousands of logical qubits "
-                                  "(Grassl et al., 2016). The policy therefore keeps symmetric crypto but requires "
-                                  "AES-256-GCM and SHA-384+. The toy oracle here marks the known key "
-                                  "(textbook construction)."})
-
-
 def run_all(log=print):
     out = {}
-    for fn in (qrng, qaoa, shor, grover):
+    for fn in (qrng, qaoa):
         try:
             out[fn.__name__] = fn()
             r = out[fn.__name__]

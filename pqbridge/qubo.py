@@ -24,9 +24,12 @@ for our QpiAI organisation.
 import itertools
 import json
 import math
+import os
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 from . import config
 from .tasks import BLACKOUT, BLAST_TRIPLES, TASK_BY_ID, TASKS
@@ -188,6 +191,33 @@ def solve_qpiai(P, names, log=print, seed=0):
     return assign, {"solver": "QpiAI Opt (native HUBO, local)", "seed": seed, "wall_s": round(time.time() - t0, 3),
                     "objective": raw.get("objective"), "solver_time_s": raw.get("solver_time_s"),
                     "job_id": raw.get("job_id"), "execution_mode": raw.get("execution_mode")}
+
+
+_POOL = None
+
+
+def _pool():
+    """Persistent worker processes for the multi-start solve: the QpiAI solver holds the GIL, so threads do not help."""
+    global _POOL
+    if _POOL is None:
+        _POOL = ProcessPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
+    return _POOL
+
+
+def _qpiai_worker(P, names, seed):
+    return solve_qpiai(P, names, seed=seed)
+
+
+def _warm_worker(_):
+    from qpiai_opt.opt_solvers import Client, solve  # noqa: F401  (import cost paid now, not on the first Plan click)
+    time.sleep(0.4)                                    # keeps this worker busy so the pool starts a new one for the next task
+
+
+def warm_pool():
+    try:
+        list(_pool().map(_warm_worker, range(min(16, os.cpu_count() or 4))))
+    except Exception:
+        pass
 
 
 def solve_sa(P, names, reads=8, sweeps=1500, seed=0):
@@ -354,11 +384,19 @@ def _optimise_native(risks, P, names, log, use_qpiai, seeds=16):
     log(f"HUBO {len(names)} binaries / {len(P)} terms ({result['hubo']['terms_by_degree'].get(3, 0)} cubic) after exact "
         f"pruning from {len(TASKS) * WINDOWS}: fits QpiAI Opt's local solver")
     best, used_fallback = None, None
+    futures = {}
+    if use_qpiai:                                       # all starts at once, one process each
+        global _POOL
+        try:
+            futures = {seed: _pool().submit(_qpiai_worker, P, names, seed) for seed in range(seeds)}
+        except BrokenProcessPool:
+            _POOL = None
+            futures = {seed: _pool().submit(_qpiai_worker, P, names, seed) for seed in range(seeds)}
     for seed in range(seeds):
         try:
             if not use_qpiai:
                 raise RuntimeError("QpiAI disabled")
-            assign, meta = solve_qpiai(P, names, log, seed=seed)
+            assign, meta = futures[seed].result()
         except Exception as e:
             used_fallback = str(e)[:200]
             assign, meta = solve_sa(P, names, reads=2, sweeps=800, seed=seed)

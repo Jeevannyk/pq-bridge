@@ -7,10 +7,15 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, detect, migrate, pipeline, risk, testbed
+from . import config, dashboard, detect, migrate, notify, pipeline, qubo, risk, testbed
 
 app = FastAPI(title="PQ-Bridge")
 risk.load_params()      # operator-edited risk assumptions survive restarts
+
+
+@app.on_event("startup")
+def _warm_solver():
+    threading.Thread(target=qubo.warm_pool, daemon=True).start()     # first Plan click should not pay process start-up
 _busy = threading.Lock()
 _current = {"op": None}
 
@@ -55,9 +60,41 @@ def status():
             "qcloud_device": config.QCLOUD_DEVICE, "waves_done": len(pipeline.waves())}
 
 
+@app.get("/api/dashboard")
+def dashboard_view():
+    try:
+        return dashboard.overview()
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"dashboard: {e}")
+
+
+@app.post("/api/audit/verify")
+def audit_verify():
+    try:
+        return dashboard.verify_audit()
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+
 @app.post("/api/scan")
 def scan():
     return _job("scan", lambda: (pipeline.scan(), pipeline.assess())[0] and {"ok": True})
+
+
+@app.get("/api/notify")
+def notify_config():
+    return notify.public_config()
+
+
+@app.post("/api/notify")
+def notify_send(bank: str | None = None):
+    return _job("notify", notify.send_report, bank)
+
+
+@app.post("/api/notify/alert")
+def notify_alert(bank: str | None = None):
+    return _job("alert", notify.send_alert, bank)
 
 
 @app.get("/api/inventory")

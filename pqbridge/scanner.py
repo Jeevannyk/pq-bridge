@@ -213,8 +213,7 @@ def scan_endpoints():
     """Live TLS posture of every running bank service (real handshakes from the toolbox)."""
     from . import migrate, testbed
     out = []
-    for s in testbed.BANK:
-        h = migrate.handshake(s)
+    for s, h in migrate.handshakes(list(testbed.BANK)).items():
         h.pop("raw", None)
         grp = h.get("group") or "?"
         out.append({"file": f"tls://{s}:443", "line": 0, "rule": "endpoint-kex", "category": "endpoint",
@@ -276,9 +275,8 @@ def _hybrid_findings(path, root, rel, kind, model):
 def scan_dir(root: Path, skip=frozenset()):
     """ONE engine for any directory of banking code: the hybrid detector reads code and config lines;
     certificates (X.509 / PEM) and dependency manifests are parsed exactly. Same finding format."""
-    import joblib
     from . import detect
-    model = joblib.load(detect.MODEL)
+    model = detect.load_model()
     root = root.resolve()
     out = []
     for path in sorted(root.rglob("*")):
@@ -318,13 +316,13 @@ def _cat(f):
     return {"certificate": "certificate", "dependency": "dependency", "config": "config"}.get(f["category"], "code")
 
 
-SIMULATORS = {"apps/probe.py", "apps/loadgen.py", "apps/legacy.py", "apps/legacy-openssl.cnf", "apps/clearing.py",
+SIMULATORS = {"apps/probe.py", "apps/legacy.py", "apps/legacy-openssl.cnf", "apps/clearing.py",
               "runtime/conf/clearing.conf"}   # test harness, customer apps and the external partner
 
 
 def scan_estate(include_endpoints=True):
     """The mini-bank estate = its source, rendered nginx configs, PKI material, plus live endpoints, all read by the
-    same engine (see scan_dir). Traffic simulators and the gate's probe are test harness, not bank estate."""
+    same engine (see scan_dir). The legacy-client simulator and the gate's probe are test harness, not bank estate."""
     findings = scan_dir(config.TESTBED, skip=SIMULATORS)
     if include_endpoints:
         try:

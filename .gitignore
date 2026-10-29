@@ -15,3 +15,7 @@ data/openssl_registry.json
 .vscode/
 .idea/
 Thumbs.db
+
+# generated artefacts
+data/model.joblib
+testbed/.build-stamp
