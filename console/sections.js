@@ -6,6 +6,13 @@ const short = (r) => r.replace(/^(Consensys|jpmorganchase|aws-samples|apache|Ope
 function renderReal(d) {
   if (!d || !d.eval) return;
   const ev = d.eval, S = d.summary;
+  const m = ev.methods, pr = (k) => (m[k] ? `P ${m[k].precision} · R ${m[k].recall}` : "–");
+  const stage = (t, k, s, hot) => `<div class="stage${hot ? " hot" : ""}"><span>${t}</span><b>${pr(k)}</b><small>${s}</small></div>`;
+  const engine = `<div class="pipe" style="margin-bottom:14px">
+    ${stage("1 · Rules", "rules only", "per-language patterns", false)}<i>+</i>
+    ${stage("2 · ML classifier", "ML classifier only (p>=0.5)", "n-grams, path, banking context", false)}<i>+</i>
+    ${stage("3 · Crypto verification", "crypto verification only", "OpenSSL registry, RFC 7518, JCA", false)}<i>⇒</i>
+    ${stage("Fused (balanced)", "fused: balanced", "a rule hit survives unless ML says no AND nothing verifies; no rule needs ML + verification", true)}</div>`;
   const meth = Object.entries(ev.methods).map(([k, v]) =>
     `<tr><td>${esc(k)}</td><td class="num">${v.precision}</td><td class="num">${v.recall}</td><td class="num">${v.f1}</td><td class="num">${v.tp}/${v.fp}/${v.fn}</td></tr>`).join("");
   const repos = Object.entries(S).filter(([, v]) => v.findings).sort((a, b) => b[1].findings - a[1].findings);
@@ -15,15 +22,15 @@ function renderReal(d) {
   const perRepo = {};
   const top = d.findings.filter((f) => (perRepo[f.repo] = (perRepo[f.repo] || 0) + 1) <= 4);
   $("#real-body").className = "";
-  $("#real-body").innerHTML = `<div class="tiles">${tile("Repositories", Object.keys(S).length, "real, cloned from GitHub")}${tile("Findings", tot, "quantum-vulnerable usage sites")}
+  $("#real-body").innerHTML = `<h3 style="margin:0 0 8px;font-size:1rem">How the engine decides (accuracy on repos it was not trained on)</h3>${engine}<div class="tiles">${tile("Repositories", Object.keys(S).length, "real, cloned from GitHub")}${tile("Findings", tot, "usage sites found in the validation repos")}
     ${tile("Crypto-verified", conf, "algorithm resolved via OpenSSL registry / RFC 7518 / JCA")}${tile("Labelled lines", ev.n, `${ev.positives} positive · leave-one-repo-out`)}</div>
-  <div class="card"><h3>Engine accuracy on held-out repositories</h3><div class="scroll"><table><tr><th>Method</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP/FP/FN</th></tr>${meth}</table></div>
+  <div class="card"><h3>Engine accuracy, tested on repositories it was not trained on</h3><div class="scroll"><table><tr><th>Method</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP/FP/FN</th></tr>${meth}</table></div>
     <p>Fused: a rule hit is kept unless ML p &lt; ${ev.thresholds.veto_t} and no algorithm verifies; a line no rule caught needs ML p ≥ ${ev.thresholds.balanced} (audit mode: ${ev.thresholds.audit}) <i>and</i> a verified algorithm.</p></div>
   <div class="scroll" style="margin-top:14px"><table><tr><th>Repository</th><th>Findings</th><th>Verified</th><th>Added by ML + verification</th><th>Production code</th><th>Primitives</th><th>Banking context</th></tr>
   ${repos.map(([r, v]) => `<tr><td class="mono">${esc(short(r))}</td><td class="num">${v.findings}</td><td class="num">${v.confirmed}</td><td class="num">${v.ml_only}</td><td class="num">${v.production}</td>
     <td>${Object.entries(v.primitives).slice(0, 4).map(([p, n]) => `${esc(p)} ${n}`).join(" · ")}</td>
     <td>${Object.entries(v.contexts).slice(0, 3).map(([p, n]) => `${esc(p)} ${n}`).join(" · ")}</td></tr>`).join("")}</table></div>
-  <h3 style="margin:18px 0 6px;font-size:1rem">Highest-severity findings, up to 4 per repository (${top.length} of ${d.total})</h3>
+  <h3 style="margin:18px 0 6px;font-size:1rem">Validation findings in real code, up to 4 per repository (${top.length} of ${d.total})</h3>
   <div class="scroll"><table><tr><th>Severity</th><th>Repository</th><th>Evidence</th><th>Primitive</th><th>Context</th><th>Detected by</th><th>ML p</th><th>Verification</th><th>Snippet</th></tr>
   ${top.map((f) => `<tr><td>${sev(f.severity)}</td><td class="mono">${esc(short(f.repo))}</td><td class="mono">${esc(f.file)}:${f.line}</td>
     <td>${esc(f.primitive || "–")}</td><td>${esc(f.banking_context)}</td><td>${esc(f.detected_by)}</td><td class="num">${f.ml_p}</td>

@@ -75,7 +75,7 @@ RULES = [
     ("ssh-classical", r"\b(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp\d+|rsa-sha2-\d+)\b"),
 ]
 RULES_C = [(n, re.compile(rx)) for n, rx in RULES]
-PQ = re.compile(r"(?i)ml-?kem|ml-?dsa|slh-?dsa|fn-?dsa|falcon|dilithium|kyber|sphincs|\bhqc|frodo|mceliece")
+PQ = re.compile(r"(?i)ml-?kem|ml-?dsa|slh-?dsa|fn-?dsa|falcon|dilithium|kyber|sphincs|hqc|frodo|mceliece")
 
 BANKING = {
     "payments_cards": r"iso.?8583|\bpan\b|\bpin\b|pinblock|emv|cvv|card|tr.?31|tr.?34|\bhsm\b|pkcs.?11|acquir|issuer|payment",
@@ -333,19 +333,52 @@ def severity(c, v):
 
 
 # ---------------------------------------------------------------- apply to repos
-def analyse_text(code, filename="snippet.py", mode="balanced"):
-    """Operator tool: run the full engine on pasted code. Returns every candidate line with its decision trail."""
+def prose_lines(lines, ext):
+    """Indices of lines inside Python docstrings / triple-quoted strings and /* */ blocks: prose, not code."""
+    masked, inside = set(), None
+    for i, l in enumerate(lines):
+        if ext == ".py":
+            if inside:
+                masked.add(i)
+                if l.count(inside) % 2 == 1:
+                    inside = None
+                continue
+            for q in ('"""', "'''"):
+                n = l.count(q)
+                if n:
+                    if l.strip().startswith(q):
+                        masked.add(i)
+                    if n % 2 == 1:
+                        inside = q
+                    break
+        elif ext in (".java", ".go", ".js", ".ts", ".rs", ".scala", ".kt", ".cs"):
+            if inside:
+                masked.add(i)
+                if "*/" in l:
+                    inside = None
+                continue
+            if "/*" in l and "*/" not in l.split("/*", 1)[1]:
+                inside = "/*"
+                if l.strip().startswith("/*"):
+                    masked.add(i)
+    return masked
+
+
+def analyse_text(code, filename="snippet.py", mode="balanced", model=None):
+    """Run the full engine on text (pasted code, or one file of the mini-bank). Returns every candidate line
+    with its decision trail: rule hits, ML probability, verification, severity, banking context."""
     import joblib
-    model = joblib.load(MODEL)
+    model = model or joblib.load(MODEL)
     lines = code.splitlines()
     ext = Path(filename).suffix.lower()
+    prose = prose_lines(lines, ext)
     cands = []
     for i, line in enumerate(lines):
         if not CANDIDATE.search(line):
             continue
         ctx = " ".join(l.strip() for l in lines[max(0, i - 2):i + 3])[:800]
         cands.append({"repo": "pasted", "file": filename, "line": i + 1, "text": line.strip()[:400], "context": ctx,
-                      "ext": ext, "comment": is_comment(line), **path_flags(filename)})
+                      "ext": ext, "comment": is_comment(line) or i in prose, **path_flags(filename)})
     if not cands:
         return []
     prob = model.predict_proba(_df(cands))[:, 1]

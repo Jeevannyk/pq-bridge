@@ -53,9 +53,11 @@ function summarise(r) {
   if (r.checks) {
     const failed = r.checks.filter((c) => !c.passed);
     const head = r.tasks && r.tasks.length ? `${r.tasks.join(", ")}: ` : "Gate on current state: ";
+    if (!failed.length && r.chain && r.chain.length > 1) return `✓ Applied in order, each step gated: ${r.chain.join(" → ")}`;
     if (!failed.length) return `✓ ${head}all ${r.checks.length} gate checks passed${r.tasks.length ? " → promoted" : ""}`;
     const rb = r.rollback ? `\n↩ auto-rolled back in ${r.rollback.restore_s} s` : r.tasks.length ? "\n⚠ left in place (auto-rollback off): use Rollback last change" : "";
-    return `✗ ${head}${failed.length} check(s) failed:\n- ${failed.map((c) => c.name).join("\n- ")}${rb}`;
+    const cf = r.chain_failed_at ? `\n(chain stopped at ${r.chain_failed_at}; earlier steps stay applied, use Rollback last change to undo them)` : "";
+    return `✗ ${head}${failed.length} check(s) failed:\n- ${failed.map((c) => c.name).join("\n- ")}${rb}${cf}`;
   }
   if (r.group !== undefined) return `${r.service}: ${r.ok ? "handshake OK" : "HANDSHAKE FAILED"} · ${r.group} / ${r.peer_sig} · ${r.bytes_read ?? "?"} B`;
   return "done";
@@ -63,8 +65,8 @@ function summarise(r) {
 
 // ---------------------------------------------------------------- overview
 const FLOW = [
-  ["inventory", "Discover the estate", "Scan code, configs, certs and live TLS of the bank. Every RSA/ECC use with evidence."],
-  ["realcode", "Analyse real code", "Hybrid ML engine on JPMorgan, AWS, Apache, Juspay and other repos, or paste your own snippet."],
+  ["inventory", "Find the mini-bank's vulnerabilities", "The hybrid engine reads its code and configs; certs and live TLS are parsed too. Every RSA/ECC use with evidence."],
+  ["realcode", "How the detector was built", "Trained and tested on real bank code (JPMorgan, AWS, Juspay, Fineract and others). Paste any snippet to see its decision trail."],
   ["survey", "Compare with real banks", "24 public bank sites: key exchange is moving, certificates are not."],
   ["risk", "Score criticality", "Mosca X+Y>Z, exposure, criticality and evidence give a risk score per migration task. Editable."],
   ["plan", "Prioritise with QpiAI Opt", "HUBO over tasks × change windows, solved on QpiAI Opt and validated against CP-SAT and greedy."],
@@ -160,11 +162,13 @@ function renderControl(tv) {
       <td class="num">${t.risk ?? "–"}</td><td class="num">${t.deferred ? "deferred" : t.window ?? "–"}</td>
       <td class="mono">${t.deps.length ? t.deps.map((d) => `<span class="${t.missing_deps.includes(d) ? "bad" : "ok"}">${d}</span>`).join("<br>") : "–"}</td>
       <td><span class="pill ${t.status === "applied" ? "pass" : t.status === "blocked" || t.status === "deferred" ? "fail" : "warn"}" title="${t.deferred ? "kept out of the plan: legacy customers cannot verify FN-DSA yet" : ""}">${t.status}</span></td>
-      <td>${t.done ? "" : t.status === "blocked" || t.status === "deferred"
-        ? `<button class="danger small" data-m="force" data-task="${t.id}" title="Apply anyway to show the gate catching it">Force</button>`
+      <td>${t.done ? "" : t.missing_deps.length
+        ? `<button class="small" data-m="apply-chain" data-task="${t.id}" title="Applies every missing prerequisite first, in order, each one tested by the gate">Apply + prerequisites</button> <button class="danger small" data-m="force" data-task="${t.id}" title="Apply only this task, anyway: expect the pre-check or the gate to refuse it">Force</button>`
+        : t.deferred
+        ? `<button class="danger small" data-m="force" data-task="${t.id}" title="Expected to fail: legacy customers cannot verify FN-DSA yet">Force</button>`
         : `<button class="small" data-m="apply" data-task="${t.id}">Apply</button>`}</td></tr>`).join("")}</table></div>
     <div class="ctrl"><button data-m="apply-selected">Apply selected together</button>
-      <span class="hint" style="margin:0">Blocked = a prerequisite is not in effect yet. Force applies it anyway so the gate can show why the order matters.</span></div></div>
+      <span class="hint" style="margin:0">Blocked = a prerequisite is not in effect yet. <b>Apply + prerequisites</b> applies the whole chain in order, each step tested. <b>Force</b> applies only that task, so the checks can show why the order matters (expect a refusal).</span></div></div>
 
   <div class="card" style="margin-top:14px"><h3>Fault scenarios: break it on purpose</h3>
     <div class="grid2" style="margin-top:6px">${SCENARIOS.map((s) => { const ok = s.can(tv); return `
@@ -242,6 +246,7 @@ document.addEventListener("click", async (e) => {
   if (!b || b.disabled) return;
   const m = b.dataset.m;
   if (m === "apply") return operate(`Apply ${b.dataset.task}`, "/api/apply", { tasks: [b.dataset.task], auto_rollback: autoRollback() });
+  if (m === "apply-chain") return operate(`Apply ${b.dataset.task} + prerequisites`, "/api/apply", { tasks: [b.dataset.task], auto_rollback: autoRollback(), with_deps: true });
   if (m === "force") {
     if (!confirm(`${b.dataset.task} has unmet prerequisites. Apply anyway to demonstrate the gate?`)) return;
     return operate(`Force ${b.dataset.task}`, "/api/apply", { tasks: [b.dataset.task], auto_rollback: autoRollback(), force: true });

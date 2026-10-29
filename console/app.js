@@ -75,20 +75,46 @@ function renderInventory() {
     tile("Quantum-vulnerable", qv.length, "RSA · ECDSA · ECDH · X25519") +
     tile("PQ-safe", f.filter((x) => x.status === "pq-safe").length, "HQC · FN-DSA · SLH-DSA · hybrid") +
     Object.entries(cats).map(([c, n]) => tile(c, n, "vulnerable")).join("");
+  $("#inv-sources").innerHTML = sourceStrip(f);
   const ev = INV.eval;
   if (ev) {
     const row = (n, k) => `<tr><td>${n}</td><td class="num">${ev[k].precision}</td><td class="num">${ev[k].recall}</td><td class="num">${ev[k].f1}</td><td class="num">${ev[k].tp}/${ev[k].fp}/${ev[k].fn}</td></tr>`;
     $("#inv-eval").innerHTML = `<div class="card"><h3>Detection accuracy on labelled corpus (${ev.labelled_positives} positives, ${ev.files} files, hard negatives included)</h3>
       <div class="scroll"><table><tr><th>Detector</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP/FP/FN</th></tr>
-      ${row("PQ-Bridge scanner", "pq_bridge")}${row("Naive grep baseline", "naive_grep")}</table></div>
+      ${row("PQ-Bridge hybrid engine", "pq_bridge")}${ev.rules_only ? row("Rules only (previous scanner)", "rules_only") : ""}${row("Naive grep baseline", "naive_grep")}</table></div>
       ${ev.pq_bridge.missed.length ? `<p>Missed: ${ev.pq_bridge.missed.map((m) => `<span class="mono">${esc(m[0])}:${m[1]}</span>`).join(", ")}</p>` : ""}</div>`;
   }
   const st = $("#f-status").value, cat = $("#f-cat").value;
   const rows = f.filter((x) => (!st || x.status === st) && (!cat || x.category === cat));
-  $("#inv-table").innerHTML = `<tr><th>Status</th><th>Category</th><th>Service</th><th>Evidence</th><th>Algorithm</th><th>Snippet</th></tr>` +
+  $("#inv-table").innerHTML = `<tr><th>Status</th><th>Service</th><th>Evidence</th><th>Found by</th><th>ML p</th><th>Severity</th><th>Algorithm</th><th>Verification</th><th>Snippet</th></tr>` +
     rows.map((x) => `<tr><td><span class="pill ${x.status === "pq-safe" ? "pq" : "qv"}">${x.status === "pq-safe" ? "PQ-safe" : "vulnerable"}</span></td>
-      <td>${esc(x.category)}</td><td>${esc(x.service || "–")}</td><td class="mono">${esc(x.file)}${x.line ? ":" + x.line : ""}</td>
-      <td>${esc(x.algorithm)}</td><td class="mono">${esc(x.snippet)}</td></tr>`).join("");
+      <td>${esc(x.service || "–")}</td><td class="mono">${esc(x.file)}${x.line ? ":" + x.line : ""}</td>
+      <td>${foundBy(x)}</td><td class="num">${x.ml_p ?? "–"}</td>
+      <td>${x.severity ? `<span class="pill ${x.severity === "critical" || x.severity === "high" ? "qv" : ""}">${esc(x.severity)}</span>` : "–"}</td>
+      <td>${esc(x.algorithm)}</td><td>${esc(x.verification || verifiedBy(x))}</td><td class="mono">${esc(x.snippet)}</td></tr>`).join("");
+}
+
+// Which part of the single engine produced a finding.
+function foundBy(x) {
+  if (x.category === "code" || x.category === "config") {
+    return x.detected_by === "rule" ? `<span class="pill warn">hybrid: rule + ML</span>` : `<span class="pill pass">hybrid: ML + verification</span>`;
+  }
+  return `<span class="pill">${{ certificate: "X.509 parser", dependency: "manifest parser", endpoint: "live TLS handshake" }[x.category] || esc(x.category)}</span>`;
+}
+const verifiedBy = (x) => ({ certificate: "parsed key type from the certificate", dependency: "exact package name", endpoint: "negotiated by a real handshake" }[x.category] || "–");
+
+// Top strip: sources -> one engine -> findings -> what they feed.
+function sourceStrip(f) {
+  const n = (fn) => f.filter(fn).length;
+  const hy = f.filter((x) => x.category === "code" || x.category === "config");
+  const box = (title, count, sub, hot) => `<div class="stage${hot ? " hot" : ""}"><span>${esc(title)}</span><b>${count}</b><small>${esc(sub)}</small></div>`;
+  return `<div class="pipe">
+    ${box("Code + nginx configs", hy.length, `${hy.filter((x) => x.detected_by === "rule").length} by rule, ${hy.filter((x) => x.detected_by !== "rule").length} by ML + verification`, true)}
+    <i>→</i>${box("Certificates + keys", n((x) => x.category === "certificate"), "X.509 parser", false)}
+    <i>→</i>${box("Dependencies", n((x) => x.category === "dependency"), "manifest parser", false)}
+    <i>→</i>${box("Live TLS endpoints", n((x) => x.category === "endpoint"), "real handshakes", false)}
+    <i>⇒</i>${box("One finding format", f.length, "evidence on every row", true)}
+    <i>⇒</i>${box("Feeds", "risk → plan → migrate", "QpiAI Opt uses these", false)}</div>`;
 }
 const tile = (l, v, s) => `<div class="tile"><span>${esc(l)}</span><b>${v}</b><br><small>${esc(s)}</small></div>`;
 

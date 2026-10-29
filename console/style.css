@@ -107,3 +107,12 @@ button.small{padding:5px 10px;font-size:.78rem}
 .flow a span{color:var(--muted);font-size:.85rem}
 .flow a:hover{border-color:var(--accent)}
 #toast{position:fixed;right:20px;bottom:20px;max-width:460px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:6px;padding:12px 16px;box-shadow:0 6px 24px rgba(0,0,0,.25);z-index:20;font-size:.9rem;white-space:pre-wrap}
+
+/* engine pipeline strips */
+.pipe{display:flex;flex-wrap:wrap;gap:6px 4px;align-items:stretch;margin:6px 0 14px}
+.pipe i{align-self:center;font-style:normal;color:var(--muted);padding:0 2px}
+.stage{flex:1 1 150px;border:1px solid var(--line);border-radius:6px;padding:9px 12px;min-width:0}
+.stage.hot{border-color:var(--accent);background:var(--accent-soft)}
+.stage span{display:block;font:600 .64rem var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.stage b{display:block;font:600 1.05rem var(--mono);margin:2px 0;overflow-wrap:anywhere}
+.stage small{color:var(--muted);font-size:.74rem;line-height:1.3;display:block}

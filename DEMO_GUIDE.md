@@ -60,8 +60,8 @@ Discover ─▶ Criticality ─▶ Prioritise (QpiAI Opt) ─▶ Migrate one cha
 
 | Step | Console page | Code | What actually happens |
 |---|---|---|---|
-| Discover (bank) | 1 · Bank inventory | `pqbridge/scanner.py` | Regex/AST-style rules over code and config, X.509/PEM parsing, dependency manifests, plus a real `openssl s_client` handshake to each service |
-| Discover (real code) | 2 · Real code | `pqbridge/detect.py` | Rules, then an ML classifier (logistic regression on n-grams, path and banking context), then crypto verification (OpenSSL registry, RFC 7518, JCA names) |
+| Find the mini-bank's vulnerabilities | 1 · Bank inventory | `pqbridge/scanner.py` → `detect.py` | The **hybrid engine** (rules + ML + verification) reads the mini-bank's code and nginx configs; X.509/PEM and dependency manifests are parsed exactly; plus a real `openssl s_client` handshake to each service |
+| How the detector was built | 2 · Detection engine | `pqbridge/detect.py` | **Trained and tested on 11 real bank / fintech repos** (read-only training data, not part of the migrated estate).  Rules, then an ML classifier (logistic regression on n-grams, path and banking context), then crypto verification (OpenSSL registry, RFC 7518, JCA names) |
 | Criticality | 4 · Criticality | `pqbridge/risk.py` | Mosca X+Y>Z urgency × exposure × criticality × evidence count, giving a risk score per service and per task |
 | Prioritise | 5 · Plan | `pqbridge/qubo.py` | Builds a HUBO (64 binaries, ~730 terms, 8 cubic terms). **QpiAI Opt** solves it multi-start; a validator checks every rule; CP-SAT (exact) and greedy are baselines; QAOA on QCloud re-checks one cluster |
 | Migrate | 7 · Migration control | `pqbridge/tasks.py`, `testbed.py` | A task changes the bank's crypto state. nginx configs are re-rendered and **gracefully reloaded** (no dropped connections); PKI tasks issue SLH-DSA / FN-DSA certs with QRNG-seeded keys |
@@ -84,7 +84,8 @@ Discover ─▶ Criticality ─▶ Prioritise (QpiAI Opt) ─▶ Migrate one cha
 - **Filters:** status and category. Every row carries evidence (`file:line` or `tls://service:443`).
 - **Demo point:** scan before migrating (everything vulnerable), then scan after a few waves. Endpoint rows flip to `x25519_hqc1` / `falcon512` (PQ-safe) and the vulnerable count drops.
 
-### 2 · Real code (ML engine)
+### 2 · Detection engine (ML), trained on real bank code
+The 11 real repos are **training and validation data only**. The engine on this page is the same one that scans the mini-bank on page 1.
 - **Paste-and-analyse box (manual criticality detection).** Click **Load sample**, then **Analyse snippet**. Each candidate line shows:
   - decision: vulnerable or ignored
   - severity: critical, high, medium or low (RSA-1024 is critical, test code is lower)
@@ -94,7 +95,7 @@ Discover ─▶ Criticality ─▶ Prioritise (QpiAI Opt) ─▶ Migrate one cha
   - banking context: payments/cards, open banking, ledger/blockchain, settlement, transport TLS
   
   Paste any code the judges suggest. Comments, imports and AES/SHA lines are correctly ignored.
-- **Analyse repositories** re-runs the engine over the 11 real repos (about 1 min). Shows:
+- **Re-validate on real repos** re-runs the engine over the 11 repos (2 to 9 minutes; don't click it live: the last results are already on the page). Shows:
   - engine accuracy, tested on repos it never saw in training
   - findings per repo with primitives and banking contexts
   - the highest-severity findings
@@ -148,9 +149,12 @@ Four circuits built gate by gate with the QpiAI Quantum SDK. Each card has the d
 **c) Migration tasks: manual, one at a time.** Ordered by the QpiAI Opt plan window, then risk.
 - **Status:** `applied`, `ready` (prerequisites in effect) or `blocked` (prerequisite missing, shown in red).
 - **Apply** runs that one task, then the full gate. Promoted, or rolled back.
-- **Force** applies a blocked task anyway, to show the gate catching a wrong order. Asks for confirmation.
+- **Apply + prerequisites** (shown on blocked tasks) applies every missing prerequisite first, in order, each as its own gated change, then the task itself. One click on `cert.ledger` does `pki.pq-root → trust.payment-switch → cert.ledger`. It stops at the first failed step; earlier steps stay applied (use **Rollback last change** to undo them one at a time).
+- **Force** applies only that task, anyway, to show why order matters. Asks for confirmation. What you will see depends on the task:
+  - certificate / trust tasks without the PQ PKI: the **pre-reload check** refuses ("`ledger.pq.crt` does not exist yet: apply `pki.pq-root` first"). Files are restored, the running bank is never touched, and the activity log shows a failed `preflight` check.
+  - JWT / key-exchange order mistakes: real traffic breaks, the gate fails and rolls back (see the Fault scenarios).
 - **Apply selected together:** tick several tasks and apply them as one change.
-- Applying a blocked task *without* Force is refused up front, with the missing prerequisites named.
+- Applying a blocked task with plain **Apply** (API call without force) is refused up front, naming the missing prerequisites and the chain that would fix it.
 
 **d) Fault scenarios: break it on purpose.** Each button is only active when the scenario can actually fail in the current state.
 
@@ -200,14 +204,14 @@ Everything the backend did, with timestamps, including refused actions.
 **Before:** Overview → *Reset bank to classical*. Leave the header visible.
 
 1. **Overview (30 s).** "A real bank runs here: 10 payments a second, a legacy customer client, all classical crypto." Point at the counters.
-2. **Bank inventory (1 min).** *Scan bank estate.* "33 quantum-vulnerable findings, each with evidence: code lines, configs, RSA certificates, live X25519 handshakes."
-3. **Real code (2 min).** *Load sample* → *Analyse snippet.* Walk through four lines:
+2. **Bank inventory (1 min).** *Scan bank estate.* "One detection engine reads the bank: its code, its nginx configs, its certificates and a live handshake per service. Each finding has evidence and an ML + verification trail. These findings set the risk scores."
+3. **Detection engine (2 min).** "This is the engine that just scanned our bank; we trained and tested it on real bank code." *Load sample* → *Analyse snippet.* Walk through four lines:
    - RSA-1024 → critical
    - `SHA256withECDSA` → JCA verified
    - `RSASSAVerifier` found by ML + verification, with no rule needed
    - the comment and AES line → ignored
    
-   Scroll down: "1,095 findings across JPMorgan, AWS, Juspay and other real repos."
+   Scroll down: "Tested on repositories it never saw in training: JPMorgan, AWS, Juspay and others, precision about 0.92, recall about 0.91."
 4. **TLS survey (30 s).** "21 of 24 banks already do PQ key exchange; none have PQ certificates."
 5. **Criticality (1 min).** Show the Mosca table. Change Z to 4 → *Re-score*. "card-auth is now at risk too." (Assumptions are saved. Set Z back to 8 and re-score after the demo.)
 6. **Plan (1.5 min).** *Generate plan.*
@@ -284,7 +288,8 @@ type testbed\runtime\conf\ledger.conf           # the nginx config the executor 
 |---|---|
 | Header shows "–" everywhere | Docker Desktop is not running, or the bank is down: Overview → Reset bank, or run `python run_all.py` |
 | A button does nothing | Another operation is running (sidebar badge). Wait, or check Operator log |
-| "prerequisites not applied" | Expected: apply the prerequisite first, or use Force to demonstrate |
+| "prerequisites not applied" | Expected: click **Apply + prerequisites**, or use Force to demonstrate the refusal |
+| Forced cert task says "does not exist yet" | Expected: the PQ PKI was not issued. Apply `pki.pq-root` first (or use Apply + prerequisites) |
 | Fault scenario says "already safe" | The state no longer allows that failure. Reset the bank |
 | Plan shows "QpiAI Opt was not used" | `QPIAI_OPT_API_KEY` missing or invalid in `.env`; restart `dev.ps1` |
 | UI not updating after code edits | `dev.ps1` must be the running server (it uses polling reload because of OneDrive) |

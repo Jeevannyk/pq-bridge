@@ -185,7 +185,7 @@ def apply(payload: dict = Body(...)):
     if not t:
         raise HTTPException(400, "no tasks given")
     return _job(f"apply {', '.join(t)}", pipeline.apply_tasks, t, bool(payload.get("auto_rollback", True)),
-                bool(payload.get("force", False)))
+                bool(payload.get("force", False)), bool(payload.get("with_deps", False)))
 
 
 @app.post("/api/rollback")

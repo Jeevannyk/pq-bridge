@@ -41,6 +41,9 @@ DEFERRED = [{"id": "cert.gateway-public", "service": "gateway",
              "title": "Switch public gateway certificate to FN-DSA-512",
              "reason": "Blocked: legacy customer clients cannot validate FN-DSA / SLH-DSA certificates yet"}]
 
+# The deferred task as an applicable task: it needs the PQ PKI (its certificate files) like every other cert task.
+DEFERRED_TASK = {**DEFERRED[0], "kind": "authentication", "effort": 1, "deps": ["pki.pq-root"]}
+
 # Three changes on the same payment path in one window = blast radius too large to isolate a failure.
 BLAST_TRIPLES = [("cert.gateway", "cert.payment-switch", "cert.ledger"),
                  ("kex.gateway", "kex.payment-switch", "kex.ledger")]

@@ -26,7 +26,7 @@
     <a href="#overview">Overview &amp; user flow</a>
     <span class="navgroup">Discover</span>
     <a href="#inventory">1 · Bank inventory</a>
-    <a href="#realcode">2 · Real code (ML engine)</a>
+    <a href="#realcode">2 · Detection engine (ML)</a>
     <a href="#survey">3 · Public TLS survey</a>
     <span class="navgroup">Decide</span>
     <a href="#risk">4 · Criticality (risk)</a>
@@ -46,9 +46,10 @@
   </section>
 
   <section id="inventory" class="page">
-    <div class="head"><div><p class="eyebrow">Module 1 · Discovery of the bank estate</p><h2>Cryptographic inventory</h2></div>
+    <div class="head"><div><p class="eyebrow">Module 1 · Discovery of the mini-bank estate</p><h2>Cryptographic inventory</h2></div>
       <button data-act="scan">Scan bank estate</button></div>
-    <p class="hint">Scans the mini-bank's code, nginx configs, certificates, keys and dependency files, then makes one real TLS handshake to every running service. Each row is a finding with file:line or endpoint evidence.</p>
+    <p class="hint">The same hybrid engine as page 2 (rules + ML classifier + crypto verification) reads the mini-bank's code and nginx configs. Certificates, keys and dependency files are parsed exactly, and one real TLS handshake is made to every running service. Each row is a finding with file:line or endpoint evidence. These findings drive the risk scores, the QpiAI plan and the migration.</p>
+    <div id="inv-sources"></div>
     <div id="inv-summary" class="tiles"></div>
     <div id="inv-eval"></div>
     <div class="filters"><label>Status <select id="f-status"><option value="quantum-vulnerable">quantum-vulnerable</option><option value="pq-safe">pq-safe</option><option value="">all</option></select></label>
@@ -57,8 +58,9 @@
   </section>
 
   <section id="realcode" class="page">
-    <div class="head"><div><p class="eyebrow">Hybrid detection engine · rules + ML classifier + crypto verification</p><h2>Real bank &amp; fintech code</h2></div>
-      <button data-act="repos">Analyse repositories</button></div>
+    <div class="head"><div><p class="eyebrow">Hybrid detection engine · rules + ML classifier + crypto verification</p><h2>Detection engine: trained on real bank code</h2></div>
+      <button data-act="repos" class="ghost">Re-validate on real repos</button></div>
+    <p class="hint">The classifier is trained and tested on 11 real bank and fintech repositories (read-only, never run). They are <b>training and validation data only</b>: the engine that scans our mini-bank on page 1 is this same engine. Re-validating takes several minutes; the last results are shown below.</p>
     <div class="card">
       <h3>Try it: paste any code</h3>
       <p class="hint">Paste Java, Go, Python, Rust, JS, Scala, nginx or OpenSSL config. Every candidate line shows the decision trail: which rule fired, the ML probability, whether the algorithm was verified, its severity and banking context.</p>
@@ -68,7 +70,7 @@
       <textarea id="an-code" rows="9" spellcheck="false" placeholder="paste code here"></textarea>
       <div id="an-out"></div>
     </div>
-    <div id="real-body" class="empty" style="margin-top:16px">Analyse the cloned repositories (JPMorgan Quorum/Tessera/Fusion, AWS Payment Cryptography, Apache Fineract, OpenBankProject, Juspay Hyperswitch, Moov, Goldman gs-quant, Hyperledger Fabric).</div>
+    <div id="real-body" class="empty" style="margin-top:16px">No validation results yet. Click Re-validate to run the engine on the cloned repositories (JPMorgan Quorum/Tessera/Fusion, AWS Payment Cryptography, Apache Fineract, OpenBankProject, Juspay Hyperswitch, Moov, Goldman gs-quant, Hyperledger Fabric).</div>
   </section>
 
   <section id="survey" class="page">

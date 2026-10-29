@@ -251,15 +251,62 @@ def prf(pred, truth):
             "f1": round(f1, 3), "false_positives": sorted(p - t), "missed": sorted(t - p)}
 
 
+def _hybrid_findings(path, root, rel, kind, model):
+    """The hybrid engine (rules + ML classifier + crypto verification) on one code / config file."""
+    from . import detect
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    out = []
+    for r in detect.analyse_text(text, rel, model=model):
+        if not r["finding"]:
+            continue
+        pq = bool(detect.PQ.search(r["snippet"]))
+        out.append({"file": rel, "line": r["line"], "rule": r["rules"][0] if r["rules"] else "ml+verification",
+                    "category": "config" if kind == "conf" else "code", "algorithm": r["primitive"] or "?",
+                    "status": "pq-safe" if pq else QV, "snippet": r["snippet"][:160], "service": service_for(path),
+                    "severity": r["severity"], "ml_p": r["ml_p"], "verification": r["verification"],
+                    "banking_context": r["banking_context"], "detected_by": "rule" if r["rules"] else "ML + verification"})
+    return out
+
+
+def scan_dir(root: Path, skip=frozenset()):
+    """ONE engine for any directory of banking code: the hybrid detector reads code and config lines;
+    certificates (X.509 / PEM) and dependency manifests are parsed exactly. Same finding format."""
+    import joblib
+    from . import detect
+    model = joblib.load(detect.MODEL)
+    root = root.resolve()
+    out = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel in skip or any(p in SKIP_DIRS for p in rel.split("/")):
+            continue
+        kind = _file_kind(path)
+        if kind == "dep":
+            out += scan_deps(path, root)
+        elif kind == "cert":
+            out += scan_pem(path, root)
+        elif kind in ("code", "conf"):
+            out += _hybrid_findings(path, root, rel, kind, model)
+    return out
+
+
 def evaluate():
+    """Accuracy of the engine that scans the mini-bank, on the hand-labelled bank corpus (corpus/)."""
     root = config.CORPUS
     truth = json.loads((root / "labels.json").read_text())["positives"]
-    found = [f for f in scan_tree(root) if f["status"] == QV]
+    found = [f for f in scan_dir(root) if f["status"] == QV]
+    rules_only = [f for f in scan_tree(root) if f["status"] == QV]
     by_cat = {}
     for cat in sorted({t["category"] for t in truth}):
         by_cat[cat] = prf([f for f in found if _cat(f) == cat], [t for t in truth if t["category"] == cat])
-    res = {"pq_bridge": prf(found, truth), "naive_grep": prf(naive_grep(root), truth), "by_category": by_cat,
-           "labelled_positives": len(truth), "files": len({t['file'] for t in truth})}
+    res = {"pq_bridge": prf(found, truth), "rules_only": prf(rules_only, truth), "naive_grep": prf(naive_grep(root), truth),
+           "by_category": by_cat, "labelled_positives": len(truth), "files": len({t['file'] for t in truth}),
+           "engine": "hybrid (rules + ML + verification) for code and config; exact parsers for certificates and dependencies"}
     config.EVIDENCE.mkdir(parents=True, exist_ok=True)
     (config.EVIDENCE / "detection_eval.json").write_text(json.dumps(res, indent=1))
     return res
@@ -273,9 +320,9 @@ SIMULATORS = {"apps/probe.py", "apps/loadgen.py", "apps/legacy.py", "apps/legacy
 
 
 def scan_estate(include_endpoints=True):
-    """The bank estate = testbed source, rendered configs, PKI material, plus live endpoints.
-    Traffic simulators and the gate's probe are test harness, not bank estate."""
-    findings = [f for f in scan_tree(config.TESTBED) if f["file"] not in SIMULATORS]
+    """The mini-bank estate = its source, rendered nginx configs, PKI material, plus live endpoints, all read by the
+    same engine (see scan_dir). Traffic simulators and the gate's probe are test harness, not bank estate."""
+    findings = scan_dir(config.TESTBED, skip=SIMULATORS)
     if include_endpoints:
         try:
             findings += scan_endpoints()

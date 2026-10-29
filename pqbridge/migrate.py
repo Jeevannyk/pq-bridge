@@ -185,9 +185,37 @@ def run_wave(index, task_ids, label=None, log=print, auto_rollback=True):
     st = copy.deepcopy(pre_state)
     changed = set()
     t0 = time.time()
-    for t in task_ids:
-        changed.update(tasks.apply(t, st))
-    testbed.apply_state(st, sorted(changed))
+    try:
+        for t in task_ids:
+            changed.update(tasks.apply(t, st))
+        testbed.apply_state(st, sorted(changed))
+    except Exception as e:
+        # Preflight failure: nginx -t (or openssl) refused the change, e.g. a certificate file that does not
+        # exist because its prerequisite was never applied. The running nginx kept its old config, but the
+        # state and .conf files on disk were already rewritten, so put every service's files back.
+        reason = str(e).strip().splitlines()
+        reason = next((l for l in reason if "emerg" in l or "Error" in l or "error" in l), reason[-1] if reason else str(e))
+        m = re.search(r'cannot load certificate "(/pki/[^"]+)"', str(e))
+        if m:
+            reason = (f"{m.group(1)} does not exist yet. Apply pki.pq-root first: it issues the SLH-DSA root, "
+                      "the FN-DSA certificates and the trust bundle")
+        log(f"[{label}] PREFLIGHT FAILED: {reason[:200]} -> restoring files, running config was never replaced")
+        t_r = time.time()
+        restored = copy.deepcopy(pre_state)
+        restored["_pki"] = st["_pki"]
+        testbed.apply_state(restored, list(testbed.ROLES))
+        rec = {"label": label, "index": index, "tasks": task_ids, "started": t0, "apply_s": round(time.time() - t0, 2),
+               "passed": False, "auto_rollback": auto_rollback, "before": before, "after": {}, "timing": {},
+               "checks": [{"category": "preflight",
+                           "name": f"nginx rejected the new config before reload: {reason[:160]}",
+                           "passed": False, "detail": str(e)[-600:]}],
+               "traffic_delta": {"pay_ok": 0, "pay_fail": 0, "legacy_ok": 0, "legacy_fail": 0, "ledger_tx": 0},
+               "rollback": {"restore_s": round(time.time() - t_r, 2), "healthy": True, "services": sorted(testbed.ROLES),
+                            "note": "files restored; running nginx was never changed, so no traffic was affected"}}
+        if label.startswith("wave") or label == "drill":
+            _record(rec)
+        _event({"type": "apply", **rec})
+        return rec
     time.sleep(SETTLE_S)
     checks, after, times, delta = run_gate(st, pre, label)
     passed = all(c["passed"] for c in checks)

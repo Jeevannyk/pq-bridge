@@ -5,7 +5,7 @@ import time
 from . import bench as bench_mod
 from . import circuits as circuits_mod
 from . import config, detect, migrate, qaoa, qubo, risk, scanner, survey, testbed
-from .tasks import DEFERRED, TASK_BY_ID, TASKS
+from .tasks import DEFERRED, DEFERRED_TASK, TASK_BY_ID, TASKS
 
 EVID = config.EVIDENCE
 LOG = []
@@ -123,7 +123,7 @@ def drill():
     if not st["_pki"]["pq_root"]:
         raise RuntimeError("drill needs the PQ PKI (run the wave that issues it first)")
     log("FAULT DRILL: switching public gateway certificate to FN-DSA before legacy clients support it")
-    TASK_BY_ID.setdefault("cert.gateway-public", {**DEFERRED[0], "kind": "authentication", "effort": 1, "deps": []})
+    TASK_BY_ID.setdefault("cert.gateway-public", DEFERRED_TASK)
     return migrate.run_wave(-1, ["cert.gateway-public"], label="drill", log=log)
 
 
@@ -203,7 +203,7 @@ def tasks_view():
     risks = (_load("risk.json") or {}).get("tasks", {})
     final = plan.get("final_plan", {})
     rows = []
-    for t in TASKS + [{**DEFERRED[0], "kind": "authentication", "effort": 1, "deps": []}]:
+    for t in TASKS + [DEFERRED_TASK]:
         done = migrate.task_done(t["id"], st)
         missing = [d for d in t["deps"] if not migrate.task_done(d, st)]
         rows.append({"id": t["id"], "title": t["title"], "service": t["service"], "kind": t["kind"],
@@ -215,20 +215,72 @@ def tasks_view():
     return {"state": st, "tasks": rows, "history": [{k: h[k] for k in ("label", "tasks", "ts")} for h in migrate.history()]}
 
 
-def apply_tasks(task_ids, auto_rollback=True, force=False):
-    """Operator applies one or more tasks now. Without force, unmet prerequisites are refused up front."""
+def _missing_closure(task_ids, st):
+    """Tasks (not yet in effect) needed to apply `task_ids`, prerequisites first (depth-first post-order)."""
+    need = []
+
+    def visit(t):
+        if t in need or migrate.task_done(t, st):
+            return
+        for d in TASK_BY_ID[t]["deps"]:
+            visit(d)
+        need.append(t)
+    for t in task_ids:
+        visit(t)
+    return need
+
+
+def _dependency_order(task_ids):
+    out, seen = [], set()
+
+    def visit(t):
+        if t in seen:
+            return
+        seen.add(t)
+        for d in TASK_BY_ID[t]["deps"]:
+            if d in task_ids:
+                visit(d)
+        out.append(t)
+    for t in task_ids:
+        visit(t)
+    return out
+
+
+def apply_tasks(task_ids, auto_rollback=True, force=False, with_deps=False):
+    """Operator applies tasks now.
+    default      : unmet prerequisites are refused up front (with the exact chain that would fix it)
+    with_deps    : apply every missing prerequisite first, in order, each as its own gated change; stop at the first failure
+    force        : apply anyway, to show the pre-reload check / gate refusing a wrong order
+    """
     st = testbed.read_state()
-    TASK_BY_ID.setdefault("cert.gateway-public", {**DEFERRED[0], "kind": "authentication", "effort": 1, "deps": []})
+    TASK_BY_ID.setdefault(DEFERRED_TASK["id"], DEFERRED_TASK)
     unknown = [t for t in task_ids if t not in TASK_BY_ID]
     if unknown:
         raise RuntimeError(f"unknown task(s): {unknown}")
+    if with_deps:
+        order = _missing_closure(task_ids, st)
+        if not order:
+            raise RuntimeError("nothing to apply: those tasks are already in effect")
+        log(f"OPERATOR: apply {task_ids} with prerequisites, in order: {' -> '.join(order)}")
+        rec = None
+        stamp = time.strftime("%H%M%S")
+        for i, t in enumerate(order):
+            rec = migrate.run_wave(-1, [t], label=f"manual-{stamp}-{i + 1}", log=log, auto_rollback=auto_rollback)
+            if not rec["passed"]:
+                rec["chain_failed_at"] = t
+                break
+        rec["chain"] = order
+        return rec
+    task_ids = _dependency_order(task_ids)
     if not force:
         missing = {t: [d for d in TASK_BY_ID[t]["deps"] if not migrate.task_done(d, st) and d not in task_ids]
                    for t in task_ids}
         missing = {t: m for t, m in missing.items() if m}
         if missing:
+            chain = _missing_closure(task_ids, st)
             raise RuntimeError("prerequisites not applied: " + "; ".join(f"{t} needs {', '.join(m)}" for t, m in missing.items())
-                               + ". Apply them first, or use Force to demonstrate what the gate does.")
+                               + f". Use 'Apply + prerequisites' to apply the chain in order ({' -> '.join(chain)}), "
+                               "or Force to see what the checks do.")
     label = f"manual-{time.strftime('%H%M%S')}"
     log(f"OPERATOR: apply {task_ids} (auto-rollback {'on' if auto_rollback else 'off'}{', FORCED' if force else ''})")
     return migrate.run_wave(-1, task_ids, label=label, log=log, auto_rollback=auto_rollback)
