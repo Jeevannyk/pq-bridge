@@ -1,0 +1,12 @@
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = sys
+
+[sys]
+# Groups = X25519MLKEM768:X25519
+Groups = X25519:P-256
+MinProtocol = TLSv1.2

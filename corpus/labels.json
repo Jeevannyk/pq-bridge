@@ -1,0 +1,176 @@
+{
+ "labelled_by": "PQ-Bridge team (manual review)",
+ "positives": [
+  {
+   "file": "payments/payments_api.py",
+   "line": 10,
+   "category": "code",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "payments/payments_api.py",
+   "line": 13,
+   "category": "code",
+   "algorithm": "RSA JWT"
+  },
+  {
+   "file": "payments/payments_api.py",
+   "line": 16,
+   "category": "code",
+   "algorithm": "RSA-OAEP encryption"
+  },
+  {
+   "file": "cards/KeyService.java",
+   "line": 9,
+   "category": "code",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "cards/KeyService.java",
+   "line": 15,
+   "category": "code",
+   "algorithm": "ECDSA"
+  },
+  {
+   "file": "cards/KeyService.java",
+   "line": 22,
+   "category": "code",
+   "algorithm": "ECDH"
+  },
+  {
+   "file": "mobile/auth.js",
+   "line": 5,
+   "category": "code",
+   "algorithm": "ECDSA"
+  },
+  {
+   "file": "mobile/auth.js",
+   "line": 8,
+   "category": "code",
+   "algorithm": "ECDSA JWT"
+  },
+  {
+   "file": "mobile/auth.js",
+   "line": 16,
+   "category": "code",
+   "algorithm": "ECDH"
+  },
+  {
+   "file": "edge/tls.go",
+   "line": 13,
+   "category": "code",
+   "algorithm": "ECDSA"
+  },
+  {
+   "file": "edge/tls.go",
+   "line": 17,
+   "category": "code",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "edge/tls.go",
+   "line": 24,
+   "category": "code",
+   "algorithm": "ECDH"
+  },
+  {
+   "file": "edge/nginx-edge.conf",
+   "line": 5,
+   "category": "config",
+   "algorithm": "ECDH"
+  },
+  {
+   "file": "edge/nginx-edge.conf",
+   "line": 6,
+   "category": "config",
+   "algorithm": "ECDHE-RSA"
+  },
+  {
+   "file": "ops/openssl.cnf",
+   "line": 11,
+   "category": "config",
+   "algorithm": "ECDH"
+  },
+  {
+   "file": "ops/keystore.sh",
+   "line": 4,
+   "category": "code",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "ops/keystore.sh",
+   "line": 5,
+   "category": "code",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "ops/ssh_config",
+   "line": 4,
+   "category": "config",
+   "algorithm": "RSA SSH"
+  },
+  {
+   "file": "ops/ssh_config",
+   "line": 5,
+   "category": "config",
+   "algorithm": "Ed25519 SSH"
+  },
+  {
+   "file": "settlement/legacy_settlement.py",
+   "line": 7,
+   "category": "code",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "settlement/legacy_settlement.py",
+   "line": 11,
+   "category": "code",
+   "algorithm": "DH"
+  },
+  {
+   "file": "settlement/legacy_settlement.py",
+   "line": 19,
+   "category": "code",
+   "algorithm": "X25519"
+  },
+  {
+   "file": "payments/requirements.txt",
+   "line": 2,
+   "category": "dependency",
+   "algorithm": "RSA/ECC"
+  },
+  {
+   "file": "payments/requirements.txt",
+   "line": 3,
+   "category": "dependency",
+   "algorithm": "RSA/ECDSA JWT"
+  },
+  {
+   "file": "mobile/package.json",
+   "line": 5,
+   "category": "dependency",
+   "algorithm": "RSA/ECDSA JWT"
+  },
+  {
+   "file": "mobile/package.json",
+   "line": 6,
+   "category": "dependency",
+   "algorithm": "RSA"
+  },
+  {
+   "file": "ops/edge.crt",
+   "line": 1,
+   "category": "certificate",
+   "algorithm": "RSA-2048"
+  }
+ ],
+ "hard_negatives_included": [
+  "comments mentioning RSA/ECC",
+  "docs/README.md",
+  "hybrid X25519MLKEM768 configs",
+  "ML-DSA keys/certs",
+  "AES-GCM / SHA-256 usage",
+  "imports without usage",
+  "strings like 'rsa keys rotated'"
+ ]
+}

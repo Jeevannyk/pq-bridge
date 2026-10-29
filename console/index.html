@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PQ-Bridge Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><b>PQ-Bridge</b><span>PQBank testbed · PQC-01</span></div>
+  <div class="live" id="live">
+    <div class="kpi"><span>Payments settled</span><b id="k-ok">–</b></div>
+    <div class="kpi"><span>Failed payments (since boot)</span><b id="k-fail">–</b></div>
+    <div class="kpi"><span>Legacy clients</span><b id="k-legacy">–</b></div>
+    <div class="kpi"><span>Ledger tx</span><b id="k-ledger">–</b></div>
+    <div class="kpi"><span>JWT alg in use</span><b id="k-alg">–</b></div>
+  </div>
+  <div class="chips" id="chips"></div>
+</header>
+
+<main>
+  <nav class="steps" id="nav">
+    <a href="#overview">Overview &amp; user flow</a>
+    <span class="navgroup">Discover</span>
+    <a href="#inventory">1 · Bank inventory</a>
+    <a href="#realcode">2 · Real code (ML engine)</a>
+    <a href="#survey">3 · Public TLS survey</a>
+    <span class="navgroup">Decide</span>
+    <a href="#risk">4 · Criticality (risk)</a>
+    <a href="#plan">5 · Plan (QpiAI Opt)</a>
+    <a href="#circuits">6 · QCloud circuits</a>
+    <span class="navgroup">Migrate</span>
+    <a href="#migrate">7 · Migration control</a>
+    <a href="#bench">8 · Benchmarks</a>
+    <a href="#report">9 · Report</a>
+    <a href="#log-sec">Operator log</a>
+    <div class="busy" id="busy" hidden></div>
+  </nav>
+
+  <section id="overview" class="page">
+    <div class="head"><div><p class="eyebrow">Verification-gated post-quantum migration for banking</p><h2>Overview &amp; user flow</h2></div></div>
+    <div id="overview-body"></div>
+  </section>
+
+  <section id="inventory" class="page">
+    <div class="head"><div><p class="eyebrow">Module 1 · Discovery of the bank estate</p><h2>Cryptographic inventory</h2></div>
+      <button data-act="scan">Scan bank estate</button></div>
+    <p class="hint">Scans the mini-bank's code, nginx configs, certificates, keys and dependency files, then makes one real TLS handshake to every running service. Each row is a finding with file:line or endpoint evidence.</p>
+    <div id="inv-summary" class="tiles"></div>
+    <div id="inv-eval"></div>
+    <div class="filters"><label>Status <select id="f-status"><option value="quantum-vulnerable">quantum-vulnerable</option><option value="pq-safe">pq-safe</option><option value="">all</option></select></label>
+      <label>Category <select id="f-cat"><option value="">all</option><option>code</option><option>config</option><option>certificate</option><option>dependency</option><option>endpoint</option></select></label></div>
+    <div class="scroll"><table id="inv-table"></table></div>
+  </section>
+
+  <section id="realcode" class="page">
+    <div class="head"><div><p class="eyebrow">Hybrid detection engine · rules + ML classifier + crypto verification</p><h2>Real bank &amp; fintech code</h2></div>
+      <button data-act="repos">Analyse repositories</button></div>
+    <div class="card">
+      <h3>Try it: paste any code</h3>
+      <p class="hint">Paste Java, Go, Python, Rust, JS, Scala, nginx or OpenSSL config. Every candidate line shows the decision trail: which rule fired, the ML probability, whether the algorithm was verified, its severity and banking context.</p>
+      <div class="formrow"><label>File name <input id="an-file" value="PaymentSigner.java"></label>
+        <label>Mode <select id="an-mode"><option value="balanced">balanced</option><option value="audit">audit (high recall)</option></select></label>
+        <button data-m="analyse">Analyse snippet</button> <button class="ghost" data-m="analyse-sample">Load sample</button></div>
+      <textarea id="an-code" rows="9" spellcheck="false" placeholder="paste code here"></textarea>
+      <div id="an-out"></div>
+    </div>
+    <div id="real-body" class="empty" style="margin-top:16px">Analyse the cloned repositories (JPMorgan Quorum/Tessera/Fusion, AWS Payment Cryptography, Apache Fineract, OpenBankProject, Juspay Hyperswitch, Moov, Goldman gs-quant, Hyperledger Fabric).</div>
+  </section>
+
+  <section id="survey" class="page">
+    <div class="head"><div><p class="eyebrow">Real-world data · one ordinary HTTPS handshake per host</p><h2>Public TLS posture of banks</h2></div>
+      <button data-act="survey" class="ghost">Re-run survey</button></div>
+    <div id="survey-body" class="empty">No survey yet.</div>
+  </section>
+
+  <section id="risk" class="page">
+    <div class="head"><div><p class="eyebrow">Module 2 · Criticality</p><h2>Quantum risk &amp; criticality</h2></div></div>
+    <div class="card"><h3>Change the assumptions and re-score</h3>
+      <p class="hint">Mosca's inequality: data is at risk when shelf-life X + migration time Y exceeds the years until a cryptographically relevant quantum computer Z. Change any value, click Re-score, then go to Plan and click Generate plan to see the priority order change.</p>
+      <div id="risk-form"></div></div>
+    <div id="risk-body" class="empty" style="margin-top:16px">Run a scan first.</div>
+  </section>
+
+  <section id="plan" class="page">
+    <div class="head"><div><p class="eyebrow">Module 3 · QpiAI Opt (HUBO) + QpiAI QCloud (QAOA)</p><h2>Prioritised migration schedule</h2></div>
+      <button data-act="plan">Generate plan</button></div>
+    <p class="hint">Turns task risk, dependencies, engineer capacity, the month-end freeze and the blast-radius rule into a HUBO. QpiAI Opt solves it; a validator checks every rule; CP-SAT and greedy show how good the plan is.</p>
+    <div id="plan-body" class="empty">Generate a plan after scanning.</div>
+  </section>
+
+  <section id="circuits" class="page">
+    <div class="head"><div><p class="eyebrow">QpiAI QCloud · circuit designs</p><h2>Quantum circuits</h2></div>
+      <button data-act="circuits" class="ghost">Re-run circuits</button></div>
+    <div id="circ-body" class="empty">Circuits are designed after the plan is generated.</div>
+  </section>
+
+  <section id="migrate" class="page">
+    <div class="head"><div><p class="eyebrow">Modules 6–7 · Executor, verification gate, rollback</p><h2>Migration control</h2></div></div>
+    <div id="control-body"></div>
+    <h3 class="sub">Planned waves (from the QpiAI Opt schedule)</h3>
+    <div class="head" style="margin:0 0 8px"><p class="hint" style="margin:0">Each wave applies its tasks, runs the full gate and is promoted or rolled back.</p>
+      <button data-act="drill" class="ghost">Run fault drill</button></div>
+    <div id="waves-body" class="empty">No plan yet.</div>
+    <h3 class="sub">Activity (every apply, gate run and rollback)</h3>
+    <div id="events-body" class="empty">No operator activity yet.</div>
+  </section>
+
+  <section id="bench" class="page">
+    <div class="head"><div><p class="eyebrow">Classical vs hybrid vs PQ-only · same OpenSSL 3.5 + oqs-provider build</p><h2>Benchmarks</h2></div>
+      <button data-act="bench" class="ghost">Re-run benchmarks</button></div>
+    <div id="bench-body" class="empty">No benchmark yet.</div>
+  </section>
+
+  <section id="report" class="page">
+    <div class="head"><div><p class="eyebrow">Evidence</p><h2>Migration report</h2></div>
+      <button data-act="report" class="ghost">Refresh report</button></div>
+    <div id="report-body" class="empty">Run the migration to build the report.</div>
+  </section>
+
+  <section id="log-sec" class="page">
+    <div class="head"><div><p class="eyebrow">Run log</p><h2>Operator log</h2></div></div>
+    <pre id="log" class="log" style="max-height:70vh"></pre>
+  </section>
+</main>
+
+<div id="toast" hidden></div>
+<dialog id="trace-dlg"><div class="dlg-head"><b id="trace-title"></b><button id="trace-close" class="ghost">Close</button></div><pre id="trace-pre"></pre></dialog>
+<script src="sections.js"></script>
+<script src="manual.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

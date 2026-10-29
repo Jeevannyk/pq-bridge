@@ -1,0 +1,5 @@
+Host settlement-sftp
+    HostName sftp.clearing.example
+    User batch
+    HostKeyAlgorithms ssh-rsa
+    PubkeyAcceptedAlgorithms ssh-ed25519

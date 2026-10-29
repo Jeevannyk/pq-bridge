@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.env
+testbed/runtime/
+evidence/
+data/repos/
+data/candidates_all.json
+data/oof_prob.npy
+data/run_all.log
+testbed-build.log
+data/*.log
+data/to_label.json
+data/openssl_registry.json
+*.pyc
+.vscode/
+.idea/
+Thumbs.db

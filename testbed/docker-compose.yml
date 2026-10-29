@@ -1,0 +1,65 @@
+name: pqbank
+
+x-node: &node
+  build: .
+  image: pqbridge-node:latest
+  networks: [bank]
+  restart: unless-stopped
+
+services:
+  # Operator toolbox on the bank network: issues certificates and runs TLS probes for the gate.
+  toolbox:
+    <<: *node
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./runtime/pki:/pki
+      - ./runtime/state:/state
+      - ./runtime/evidence:/evidence
+
+  gateway:
+    <<: *node
+    command: ["gateway"]
+    ports: ["8443:443"]
+    volumes: &svcvols
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state:ro
+      - ./runtime/conf:/conf:ro
+
+  card-auth:
+    <<: *node
+    command: ["card-auth"]
+    volumes: *svcvols
+
+  payment-switch:
+    <<: *node
+    command: ["payment-switch"]
+    volumes: *svcvols
+
+  ledger:
+    <<: *node
+    command: ["ledger"]
+    volumes:
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state:ro
+      - ./runtime/conf:/conf:ro
+      - ledger-data:/data
+
+  loadgen:
+    <<: *node
+    command: ["loadgen"]
+    volumes:
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state
+
+  legacy:
+    <<: *node
+    command: ["legacy"]
+    volumes:
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state
+
+networks:
+  bank: {}
+
+volumes:
+  ledger-data: {}

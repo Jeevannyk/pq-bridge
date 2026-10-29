@@ -1,0 +1,12 @@
+qpiai-quantum==0.3.0
+qpiai-opt[quantum]==0.0.9
+ortools
+cryptography
+scipy
+numpy
+fastapi
+uvicorn[standard]
+scikit-learn
+pandas
+joblib
+matplotlib

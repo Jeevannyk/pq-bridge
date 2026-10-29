@@ -1,0 +1,8 @@
+{
+  "name": "mobile-backend",
+  "dependencies": {
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "node-rsa": "^1.1.1"
+  }
+}
