@@ -22,7 +22,7 @@ def main():
     pipeline.tls_survey()     # real public TLS posture
     pipeline.assess()
     plan = pipeline.plan()
-    pipeline.circuits()       # QRNG / QAOA / Shor / Grover designs on QpiAI QCloud
+    pipeline.circuits()       # QRNG / QAOA designs on QpiAI QCloud
     for i in range(len(plan["final_waves"])):
         rec = pipeline.run_wave(i)
         if not rec["passed"]:

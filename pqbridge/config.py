@@ -27,28 +27,52 @@ QPIAI_OPT_API_KEY = os.environ.get("QPIAI_OPT_API_KEY")
 QCLOUD_API_KEY = os.environ.get("QCLOUD_API_KEY")
 # QpiAI-QSV-Local runs the QpiAI simulator in-process; set QCLOUD_DEVICE to a cloud device to use QCloud.
 QCLOUD_DEVICE = os.environ.get("QCLOUD_DEVICE", "QpiAI-QSV-Local")
+# The two showcase circuits (QRNG, QAOA ansatz) run once on this device. QpiAI-QSV-Local runs in-process (no
+# subscription); set a cloud device such as QpiAI-QSV-Lite once the QCloud account has an active subscription.
+CIRCUIT_DEVICE = os.environ.get("QCLOUD_CIRCUIT_DEVICE", "QpiAI-QSV-Local")
+QCLOUD_EXPERIMENT = os.environ.get("QCLOUD_EXPERIMENT", "Default Experiment")   # QCloud jobs need an existing experiment
 
-# Bank services in the testbed. Values feed the risk model (Module 2).
+# The bank. Values feed the risk model (Module 2).
 #   shelf_life_years: how long data protected by this service must stay confidential
 #   exposure: 1.0 internet-facing, 0.5 internal
-#   criticality: 1.0 on the payment path
+#   criticality: 1.0 on the money path
 SERVICES = {
-    "gateway":        {"desc": "Public API gateway (net-banking + mobile)", "shelf_life_years": 7,  "exposure": 1.0, "criticality": 1.0},
-    "card-auth":      {"desc": "Card authorisation, issues JWTs",          "shelf_life_years": 1,  "exposure": 0.5, "criticality": 1.0},
-    "payment-switch": {"desc": "Payment switch, verifies JWTs, routes tx", "shelf_life_years": 7,  "exposure": 0.5, "criticality": 1.0},
-    "ledger":         {"desc": "Core ledger (account balances)",           "shelf_life_years": 10, "exposure": 0.5, "criticality": 1.0},
+    "gateway":    {"desc": "Public API gateway: TLS for customers, rate limiting, routing",    "shelf_life_years": 7,  "exposure": 1.0, "criticality": 1.0},
+    "identity":   {"desc": "Customer login (scrypt), OAuth2 access + refresh tokens, JWKS",      "shelf_life_years": 5,  "exposure": 0.5, "criticality": 1.0},
+    "accounts":   {"desc": "Customer accounts and balances",                                     "shelf_life_years": 10, "exposure": 0.5, "criticality": 0.8},
+    "payments":   {"desc": "Transfers: scopes, idempotency keys, limits, fraud rule",            "shelf_life_years": 7,  "exposure": 0.5, "criticality": 1.0},
+    "ledger":     {"desc": "Double-entry books, signed hash-chained audit log",                  "shelf_life_years": 10, "exposure": 0.5, "criticality": 1.0},
+    "kms":        {"desc": "Key management: holds signing keys, signs for authorised services",  "shelf_life_years": 10, "exposure": 0.5, "criticality": 1.0},
+    "settlement": {"desc": "End-of-day signed batch file to the clearing house",                 "shelf_life_years": 10, "exposure": 0.5, "criticality": 0.8},
+    "postgres":   {"desc": "Bank database (PostgreSQL 17) behind mTLS",                         "shelf_life_years": 10, "exposure": 0.5, "criticality": 1.0},
 }
+# External partner: we coordinate with it, we do not migrate it ourselves.
+PARTNERS = {"clearing": {"desc": "Clearing house (external): receives signed settlement batches"}}
 
-# Which service calls which (client -> server) over mTLS.
-CALLS = [("gateway", "card-auth"), ("gateway", "payment-switch"), ("payment-switch", "ledger")]
+# Who calls whom over mTLS (client -> server). Drives nginx egress config, cert/trust dependencies,
+# PQ-only prerequisites and the blast-radius rules.
+CALLS = [
+    ("gateway", "identity"), ("gateway", "accounts"), ("gateway", "payments"),
+    ("identity", "kms"), ("identity", "postgres"),
+    ("accounts", "identity"), ("accounts", "postgres"),
+    ("payments", "identity"), ("payments", "ledger"), ("payments", "postgres"),
+    ("ledger", "kms"), ("ledger", "postgres"),
+    ("settlement", "kms"), ("settlement", "postgres"), ("settlement", "clearing"),
+]
 
+_net = {"kex": "classical", "cert": "rsa", "trust": "rsa"}
 # Baseline crypto posture: everything classical.
 INITIAL_STATE = {
-    "gateway":        {"kex": "classical", "public_cert": "rsa", "cert": "rsa", "trust": "rsa"},
-    "card-auth":      {"kex": "classical", "cert": "rsa", "trust": "rsa", "jwt_alg": "RS256"},
-    "payment-switch": {"kex": "classical", "cert": "rsa", "trust": "rsa", "jwt_accept": ["RS256"]},
-    "ledger":         {"kex": "classical", "cert": "rsa", "trust": "rsa"},
-    "_pki":           {"pq_root": False, "jwt_pq_key": False},
+    "gateway":    {**_net, "public_cert": "rsa"},
+    "identity":   {**_net, "jwt_alg": "RS256", "jwt_publish": ["RS256"]},
+    "accounts":   {**_net, "jwt_accept": ["RS256"]},
+    "payments":   {**_net, "jwt_accept": ["RS256"]},
+    "ledger":     {**_net, "audit_alg": "RS256"},
+    "kms":        {**_net},
+    "settlement": {**_net, "settle_alg": "RS256"},
+    "postgres":   {**_net},
+    "clearing":   {**_net, "accept_settle": ["RS256"]},
+    "_pki":       {"pq_root": False},
 }
 
 # Post-quantum suite (team decision): HQC key exchange, FN-DSA-512 leaf certificates and JWTs,
@@ -58,7 +82,8 @@ PQ = {
     "pq_group": "hqc1",                     # HQC-1 only
     "leaf_sig": "falcon512",                # FN-DSA-512 (Falcon) via oqs-provider
     "root_sig": "SLH-DSA-SHA2-128s",        # FIPS 205, native in OpenSSL 3.5
-    "jwt_alg": "FN-DSA-512",
+    "jwt_alg": "FN-DSA-512",            # OAuth2 access tokens and the audit log
+    "settle_alg": "SLH-DSA-SHA2-128s",  # settlement files: low volume, long-lived, most conservative
 }
 GROUPS = {
     "classical": "X25519:prime256v1",

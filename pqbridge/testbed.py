@@ -7,13 +7,18 @@ import json
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import config
 from .config import CONF, GROUPS, INITIAL_STATE, PKI, PQ, RUNTIME, STATE, TESTBED
 
 COMPOSE = ["docker", "compose", "-f", str(TESTBED / "docker-compose.yml")]
-ROLES = ["gateway", "card-auth", "payment-switch", "ledger"]
-IDENTITIES = ROLES + ["probe"]
+BANK = list(config.SERVICES)                      # the bank's own services
+ROLES = BANK + list(config.PARTNERS)              # every node with an nginx sidecar (incl. the clearing house)
+IDENTITIES = ROLES + ["probe"]                    # every TLS identity (probe = the gate's test client)
+KMS = RUNTIME / "kms"
+CLEARING_TRUST = RUNTIME / "clearing-trust"
+KMS_PURPOSES = ["jwt", "audit", "settlement"]
 
 
 def run(cmd, check=True, timeout=600):
@@ -71,6 +76,12 @@ def _seed_file(label, seed_hex):
     return f"printf '{seed_hex}' | python3 -c 'import sys;sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))' > /tmp/q_{label}.bin"
 
 
+def _parallel(snippets):
+    """One shell command that runs every snippet at the same time and fails if any of them fails."""
+    jobs = "".join(f"( {s} ) & pids=\"$pids $!\"; " for s in snippets)
+    return f"pids=''; {jobs}fail=0; for p in $pids; do wait $p || fail=1; done; [ $fail = 0 ]"
+
+
 def _leaf(name, alg, seed=None):
     """Shell snippet: key + CSR + cert for one identity, signed by the matching root."""
     san = f"DNS:{name}" + (",DNS:localhost" if name == "gateway" else "")
@@ -88,16 +99,18 @@ def _leaf(name, alg, seed=None):
 
 
 def pki_init():
-    """Classical baseline PKI: RSA-2048 root, RSA leaf certs, RS256 JWT key."""
+    """Classical baseline: RSA-2048 root + leaf certs; KMS RSA keys for jwt / audit / settlement;
+    the clearing house trusts the bank's RSA settlement key."""
     steps = [
-        "cd /pki && mkdir -p certs trust jwt",
+        "cd /pki && mkdir -p certs trust",
         "openssl req -x509 -newkey rsa:2048 -nodes -keyout rsa-root.key -out rsa-root.crt "
         f"-subj '/CN=PQBank RSA Root CA' -days 365 {CA_EXT} 2>/dev/null",
-        *[_leaf(n, "rsa") for n in IDENTITIES],
-        "openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt/rs256.key",
-        "openssl pkey -in jwt/rs256.key -pubout -out jwt/rs256.pub",
+        _parallel([*[_leaf(n, "rsa") for n in IDENTITIES],
+                   *[f"openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /kms/{p}.rsa.key && "
+                     f"openssl pkey -in /kms/{p}.rsa.key -pubout -out /kms/{p}.rsa.pub" for p in KMS_PURPOSES]]),
+        "cp /kms/settlement.rsa.pub /clearing-trust/settlement-rsa.pem",
         "cp rsa-root.crt trust/rsa.pem && cp rsa-root.crt trust/client-trust.pem",
-        "chmod -R a+r /pki",
+        "chmod -R a+r /pki /clearing-trust",
     ]
     tool(" && ".join(steps), timeout=300)
 
@@ -109,7 +122,7 @@ def pki_issue_pq(seeds):
         f"{_seed_file('root', seeds['root'])} && openssl genpkey -algorithm {PQ['root_sig']} "
         "-rand /tmp/q_root.bin -out pq-root.key",
         f"openssl req -x509 -new -key pq-root.key -subj '/CN=PQBank SLH-DSA Root CA' -days 3650 {CA_EXT} -out pq-root.crt",
-        *[_leaf(n, "pq", seeds[n]) for n in IDENTITIES],
+        _parallel([_leaf(n, "pq", seeds[n]) for n in IDENTITIES]),
         "cat rsa-root.crt pq-root.crt > trust/both.tmp && mv trust/both.tmp trust/both.pem",
         "cp trust/both.pem trust/ct.tmp && mv trust/ct.tmp trust/client-trust.pem",
         "chmod -R a+r /pki",
@@ -117,87 +130,165 @@ def pki_issue_pq(seeds):
     tool(" && ".join(steps), timeout=300)
 
 
-def pki_jwt_pq(seed):
-    tool(f"cd /pki && {_seed_file('jwt', seed)} && openssl genpkey -algorithm {PQ['leaf_sig']} -rand /tmp/q_jwt.bin "
-         "-out jwt/fndsa512.key && openssl pkey -in jwt/fndsa512.key -pubout -out jwt/fndsa512.pub && chmod -R a+r /pki")
+KMS_ALG = {"fndsa": PQ["leaf_sig"], "slhdsa": PQ["root_sig"]}
+
+
+def kms_keygen(purpose, tag, seed):
+    """Create a new KMS signing key (QRNG-seeded) for a purpose: tag fndsa (FN-DSA-512) or slhdsa (SLH-DSA)."""
+    tool(f"{_seed_file(purpose + tag, seed)} && openssl genpkey -algorithm {KMS_ALG[tag]} -rand /tmp/q_{purpose}{tag}.bin "
+         f"-out /kms/{purpose}.{tag}.key && openssl pkey -in /kms/{purpose}.{tag}.key -pubout -out /kms/{purpose}.{tag}.pub")
+
+
+def kms_has(purpose, tag):
+    return (KMS / f"{purpose}.{tag}.pub").exists()
+
+
+def clearing_trust_key(purpose, tag):
+    """Hand the clearing house (partner) the bank's new public key, as a bank would in a key ceremony."""
+    tool(f"cp /kms/{purpose}.{tag}.pub /clearing-trust/{purpose}-{tag}.pem && chmod a+r /clearing-trust/*")
 
 
 # ------------------------------------------------------------------ nginx ----
-def _upstream(svc_state, target):
-    cert = svc_state["cert"]
+# While a change is applied a hop can refuse or miss a connection. Answer with JSON 503 (which NetBank retries quietly)
+# instead of nginx's HTML 400/502 page, which a customer would see as "Request failed".
+BUSY_MSG = "PQBank is applying a security update. Please try again in a moment."
+BUSY_JSON = '{"error":"' + BUSY_MSG + '","retry":true}'
+GATEWAY_BUSY = f"error_page 502 503 504 = @bank_busy; location @bank_busy {{ default_type application/json; return 503 '{BUSY_JSON}'; }}"
+SIDECAR_BUSY = f"error_page 495 496 497 = @tls_refused; location @tls_refused {{ default_type application/json; return 503 '{BUSY_JSON}'; }}"
+
+
+def _out_groups(svc_state):
     # A PQ-enabled client must also offer the pure PQ group, or it cannot reach a PQ-only peer.
-    out_groups = f"{GROUPS['hybrid']}:{PQ['pq_group']}" if svc_state["kex"] != "classical" else GROUPS["classical"]
-    # A request landing on a peer mid-reload is retried once; the ledger is idempotent on tx_id.
+    return f"{GROUPS['hybrid']}:{PQ['pq_group']}" if svc_state["kex"] != "classical" else GROUPS["classical"]
+
+
+def _client_tls(name, s, target, prefix="proxy_"):
+    """mTLS settings for a client (this node) talking to `target`."""
     return f"""
-      proxy_pass https://{target.replace('-', '_')};
-      proxy_next_upstream error timeout http_502 non_idempotent;
-      proxy_next_upstream_tries 3;
-      proxy_ssl_server_name on;
-      proxy_ssl_name {target};
-      proxy_ssl_protocols TLSv1.3;
-      proxy_ssl_verify on;
-      proxy_ssl_verify_depth 2;
-      proxy_ssl_trusted_certificate /pki/trust/{svc_state['trust']}.pem;
-      proxy_ssl_certificate /pki/certs/{{name}}.{cert}.crt;
-      proxy_ssl_certificate_key /pki/certs/{{name}}.{cert}.key;
-      proxy_ssl_conf_command Groups {out_groups};"""
+      {prefix}ssl_server_name on;
+      {prefix}ssl_name {target};
+      {prefix}ssl_protocols TLSv1.3;
+      {prefix}ssl_verify on;
+      {prefix}ssl_verify_depth 2;
+      {prefix}ssl_trusted_certificate /pki/trust/{s['trust']}.pem;
+      {prefix}ssl_certificate /pki/certs/{name}.{s['cert']}.crt;
+      {prefix}ssl_certificate_key /pki/certs/{name}.{s['cert']}.key;
+      {prefix}ssl_conf_command Groups {_out_groups(s)};"""
+
+
+def _proxy(name, s, target, strip=True, read_timeout=None):
+    up = target.replace("-", "_")
+    # A request landing on a peer mid-reload is retried; payments/ledger are idempotent on transfer ids.
+    rt = f"\n      proxy_read_timeout {read_timeout}s;" if read_timeout else ""
+    return f"""
+      proxy_pass https://{up}{'/' if strip else ''};
+      proxy_set_header Host {target};
+      proxy_connect_timeout 3s;{rt}
+      proxy_next_upstream error timeout http_502 http_503 non_idempotent;
+      proxy_next_upstream_tries 3;{_client_tls(name, s, target)}"""
+
+
+def _server_tls(name, s, cert=None, verify_client=True):
+    c = cert or s["cert"]
+    v = f"""
+    ssl_client_certificate /pki/trust/{s['trust']}.pem;
+    ssl_verify_client on;
+    ssl_verify_depth 2;""" if verify_client else ""
+    return f"""
+    ssl_certificate /pki/certs/{name}.{c}.crt;
+    ssl_certificate_key /pki/certs/{name}.{c}.key;
+    ssl_ecdh_curve {GROUPS[s['kex']]};{v}"""
 
 
 def render_conf(name, st):
     s = st[name]
-    targets = {"gateway": ["card-auth", "payment-switch"], "payment-switch": ["ledger"]}.get(name, [])
-    upstreams = "".join(
-        f"  upstream {t.replace('-', '_')} {{ server {t}:443 max_fails=0; server {t}:443 max_fails=0; }}\n"
-        for t in targets)
-    head = f"""worker_processes 1;
-pid /run/nginx/{name}.pid;
-error_log /dev/stderr warn;
-events {{ worker_connections 512; }}
-http {{
-  access_log off;
-{upstreams}"""
+    http_targets = [t for c, t in config.CALLS if c == name and t != "postgres"]
+    uses_db = (name, "postgres") in config.CALLS
+    upstreams = "".join(f"  upstream {t.replace('-', '_')} {{ server {t}:443 max_fails=0; server {t}:443 max_fails=0; }}\n"
+                        for t in http_targets)
+    out = [("load_module /usr/lib/nginx/modules/ngx_stream_module.so;\n" if uses_db or name == "postgres" else "")
+           + f"worker_processes 1;\npid /run/nginx/{name}.pid;\nerror_log /dev/stderr warn;\nevents {{ worker_connections 512; }}\n"]
+
     if name == "gateway":
-        body = f"""
+        r = lambda t, strip=False: _proxy(name, s, t, strip)
+        pay = lambda: _proxy(name, s, "payments", False, read_timeout=75)    # a payment may wait out a rollback inside the bank
+        out.append(f"""http {{
+  access_log off;
+  log_format cust 'CUST $msec $status $request_method $uri "$http_user_agent"';
+  include /etc/nginx/mime.types;
+  limit_req_zone $binary_remote_addr zone=api:10m rate=300r/s;
+{upstreams}
   server {{
     listen 443 ssl;
     server_name gateway localhost;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_certificate /pki/certs/gateway.{s['public_cert']}.crt;
-    ssl_certificate_key /pki/certs/gateway.{s['public_cert']}.key;
-    ssl_ecdh_curve {GROUPS[s['kex']]};
+    ssl_protocols TLSv1.2 TLSv1.3;{_server_tls(name, s, cert=s['public_cert'], verify_client=False)}
+    {GATEWAY_BUSY}
     location = /health {{ default_type application/json; return 200 '{{"ok":true}}'; }}
-    location /auth/ {{{_upstream(s, 'card-auth').replace('{name}', name)}
+    location /oauth/ {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{r('identity')}
     }}
-    location = /pay {{{_upstream(s, 'payment-switch').replace('{name}', name)}
+    location = /.well-known/jwks.json {{{r('identity')}
+    }}
+    location /api/auth/ {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{r('identity')}
+    }}
+    location /api/accounts {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{r('accounts')}
+    }}
+    location /api/payments/ {{ limit_req zone=api burst=600 nodelay; access_log /dev/stdout cust;{pay()}
+    }}
+    location = /favicon.ico {{ return 204; }}
+    location / {{
+      root /netbank;
+      index index.html;
+      add_header Cache-Control "no-store" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-Frame-Options "DENY" always;
+      add_header Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'" always;
     }}
   }}
 }}
-"""
-    else:
-        body = f"""
+""")
+    elif name != "postgres":
+        egress = "".join(f"""
+    location /{t}/ {{{_proxy(name, s, t)}
+    }}""" for t in http_targets)
+        out.append(f"""http {{
+  access_log off;
+{upstreams}
   server {{
     listen 443 ssl;
     server_name {name};
-    ssl_protocols TLSv1.3;
-    ssl_certificate /pki/certs/{name}.{s['cert']}.crt;
-    ssl_certificate_key /pki/certs/{name}.{s['cert']}.key;
-    ssl_ecdh_curve {GROUPS[s['kex']]};
-    ssl_client_certificate /pki/trust/{s['trust']}.pem;
-    ssl_verify_client on;
-    ssl_verify_depth 2;
-    location / {{ proxy_pass http://127.0.0.1:8000; }}
-  }}
-"""
-        if name == "payment-switch":
-            body += f"""
-  server {{
-    listen 127.0.0.1:9001;
-    location / {{{_upstream(s, 'ledger').replace('{name}', name)}
+    ssl_protocols TLSv1.3;{_server_tls(name, s)}
+    {SIDECAR_BUSY}
+    location / {{
+      proxy_pass http://127.0.0.1:8000;
+      proxy_set_header X-Client-CN $ssl_client_s_dn;
     }}
   }}
-"""
-        body += "}\n"
-    return head + body
+""" + (f"""
+  server {{
+    listen 127.0.0.1:9001;{egress}
+  }}
+""" if http_targets else "") + "}\n")
+
+    if name == "postgres":
+        out.append(f"""stream {{
+  server {{
+    listen 5432 ssl;
+    ssl_protocols TLSv1.3;{_server_tls(name, s)}
+    proxy_pass 127.0.0.1:5433;
+  }}
+}}
+""")
+    elif uses_db:
+        out.append(f"""stream {{
+  upstream pg {{ server postgres:5432; }}
+  server {{
+    listen 127.0.0.1:6543;
+    proxy_pass pg;
+    proxy_ssl on;{_client_tls(name, s, "postgres")}
+  }}
+}}
+""")
+    return "".join(out)
 
 
 def write_confs(st, only=None):
@@ -213,17 +304,33 @@ def reload(name):
 
 def apply_state(st, changed):
     write_state(st)
-    write_confs(st, only=[c for c in changed if c in ROLES])
-    for c in changed:
-        if c in ROLES:
-            reload(c)
+    roles = [c for c in changed if c in ROLES]
+    write_confs(st, only=roles)
+    with ThreadPoolExecutor(max_workers=max(1, len(roles))) as ex:      # independent containers: reload side by side
+        for f in [ex.submit(reload, c) for c in roles]:
+            f.result()
 
 
 # ------------------------------------------------------------- lifecycle ----
+BUILD_STAMP = TESTBED / ".build-stamp"
+BUILD_SOURCES = ["Dockerfile", "apps", "openssl-oqs.cnf", "start.sh"]
+
+
+def _needs_build():
+    """The apps are baked into the image, so rebuild when any of them is newer than the last build (or the image is gone)."""
+    if not BUILD_STAMP.exists() or run(["docker", "image", "inspect", "pqbridge-node:latest"], check=False).returncode != 0:
+        return True
+    files = [f for s in BUILD_SOURCES for f in ([TESTBED / s] if (TESTBED / s).is_file() else (TESTBED / s).rglob("*"))
+             if f.is_file() and "__pycache__" not in f.parts]
+    return any(f.stat().st_mtime > BUILD_STAMP.stat().st_mtime for f in files)
+
+
 def up():
-    for d in (PKI, STATE, CONF, RUNTIME / "evidence"):
+    for d in (PKI, STATE, CONF, RUNTIME / "evidence", KMS, CLEARING_TRUST):
         d.mkdir(parents=True, exist_ok=True)
-    compose("build", timeout=3600)        # first build compiles liboqs; slow laptops need well over 15 min
+    if _needs_build():
+        compose("build", timeout=3600)    # first build compiles liboqs; slow laptops need well over 15 min
+        BUILD_STAMP.touch()
     compose("up", "-d", "toolbox")
     if not (PKI / "rsa-root.crt").exists():
         pki_init()
@@ -234,18 +341,22 @@ def up():
     wait_healthy()
 
 
-def wait_healthy(timeout=90):
+def wait_healthy(timeout=240):
+    """The bank is up when a customer can sign in and read their accounts through the public gateway."""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        lg = read_json("loadgen.json")
-        if lg.get("ok", 0) > 5:
-            return True
-        time.sleep(2)
-    raise RuntimeError("testbed did not start serving payments; check `docker compose logs`")
+        p = tool("python3 /apps/probe.py canary", check=False, timeout=60)
+        try:
+            if json.loads(p.stdout.strip().splitlines()[-1]).get("ok"):
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError("the bank did not start serving customers; check `docker compose -f testbed/docker-compose.yml logs`")
 
 
 def down(wipe=False):
-    compose("down", "-v" if wipe else "--remove-orphans", check=False)
+    compose("down", "-t", "0" if wipe else "5", *(["-v"] if wipe else []), "--remove-orphans", check=False)   # wiping: nothing to shut down gracefully
     if wipe and RUNTIME.exists():
         shutil.rmtree(RUNTIME)
 
@@ -259,4 +370,29 @@ def ledger_stats():
 
 
 def traffic():
-    return {"payments": read_json("loadgen.json"), "legacy": read_json("legacy.json"), "ledger": ledger_stats()}
+    return {"legacy": read_json("legacy.json"), "ledger": ledger_stats()}
+
+
+def customer_traffic(since):
+    """What real customers got from the gateway since `since` (epoch seconds), read from its access log.
+    The gate's own probe (User-Agent pqbridge-probe) is not a customer and is left out."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since - 1))
+    p = compose("logs", "gateway", "--no-log-prefix", "--since", stamp, check=False, timeout=60)
+    n = errors = payments = 0
+    failed = {}
+    for line in p.stdout.splitlines():
+        parts = line.split(" ", 5)
+        if len(parts) < 6 or parts[0] != "CUST":
+            continue
+        try:
+            ts, status = float(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if ts < since or "pqbridge-probe" in parts[5]:
+            continue
+        n += 1
+        payments += parts[3] == "POST" and parts[4].startswith("/api/payments/")
+        if status >= 500:
+            errors += 1
+            failed[f"{status} {parts[3]} {parts[4]}"] = failed.get(f"{status} {parts[3]} {parts[4]}", 0) + 1
+    return {"requests": n, "payments": payments, "errors_5xx": errors, "failed": failed}

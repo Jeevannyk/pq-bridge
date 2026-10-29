@@ -63,7 +63,7 @@ def benchmarks():
 
 
 def circuits():
-    log(f"Designing and running QpiAI QCloud circuits on {config.QCLOUD_DEVICE}")
+    log(f"Designing and running QpiAI QCloud circuits on {config.CIRCUIT_DEVICE}")
     return circuits_mod.run_all(log=log)
 
 
@@ -136,7 +136,6 @@ def waves():
 
 def report():
     res = _load("plan.json") or {}
-    ws = waves()
     ev = _load("detection_eval.json") or {}
     inv = _load("inventory.json") or []
     qr = []
@@ -144,8 +143,34 @@ def report():
         qr = [json.loads(l) for l in (EVID / "qrng_runs.jsonl").read_text().splitlines() if l.strip()]
     except Exception:
         pass
-    total_pay = sum(w["traffic_delta"]["pay_ok"] for w in ws)
-    failed_pay = sum(w["traffic_delta"]["pay_fail"] for w in ws)
+    evs = migrate.events(limit=10 ** 6)[::-1]                      # oldest first; every apply, wave, rollback, gate run
+    changes = []
+    for e in evs:
+        checks = e.get("checks") or []
+        td = e.get("traffic_delta") or {}
+        if e.get("type") == "rollback":
+            outcome = "undone by operator"
+        elif e.get("type") == "gate":
+            outcome = "gate passed" if e.get("passed") else "gate failed"
+        else:
+            outcome = "rolled back" if e.get("rollback") else "promoted" if e.get("passed") else "failed, left in place"
+        changes.append({"ts": e.get("ts"), "type": e.get("type"), "label": e.get("label"), "tasks": e.get("tasks") or [],
+                        "outcome": outcome, "checks_passed": sum(bool(c.get("passed")) for c in checks), "checks": len(checks),
+                        "failed_checks": [c["name"] for c in checks if not c.get("passed")][:4],
+                        "apply_s": e.get("apply_s"), "restore_s": (e.get("rollback") or {}).get("restore_s"),
+                        "probe_ops": td.get("probe_ops"), "probe_failed": td.get("probe_failed"),
+                        "probe_retried": td.get("probe_retried"), "probe_max_s": td.get("probe_max_s"),
+                        "probe_payments": td.get("probe_payments"),
+                        "customer_requests": td.get("customer_requests"), "customer_5xx": td.get("customer_5xx"),
+                        "legacy_ok": td.get("legacy_ok"), "legacy_fail": td.get("legacy_fail")})
+    applies = [c for c in changes if c["type"] == "apply"]
+    tv = tasks_view()
+    core = [t for t in tv["tasks"] if not t["deferred"]]
+    during = {"operations": sum(c["probe_ops"] or 0 for c in changes), "payments": sum(c["probe_payments"] or 0 for c in changes),
+              "failed": sum(c["probe_failed"] or 0 for c in changes), "retried": sum(c["probe_retried"] or 0 for c in changes),
+              "slowest_s": max([c["probe_max_s"] or 0 for c in changes] or [0]),
+              "customer_requests": sum(c["customer_requests"] or 0 for c in changes),
+              "customer_5xx": sum(c["customer_5xx"] or 0 for c in changes)}
     ml = _load("ml_eval.json") or {}
     rf = _load("repo_findings.json") or {}
     sv = _load("tls_survey.json") or {}
@@ -155,7 +180,7 @@ def report():
         "ml_engine": {k: ml.get("methods", {}).get(k) for k in ("rules only", "fused: balanced", "fused: audit (high recall)")},
         "real_repos": {k: {"findings": v["findings"], "confirmed": v["confirmed"]} for k, v in rf.get("summary", {}).items()},
         "tls_survey": sv.get("summary"),
-        "benchmarks_tls": [{k: r[k] for k in ("mode", "bytes_total", "median_ms", "handshakes_per_wall_sec")} for r in bm.get("tls", [])],
+        "benchmarks_tls": [{k: r[k] for k in ("mode", "bytes_total", "median_ms", "handshakes_per_s")} for r in bm.get("tls", [])],
         "inventory": {"findings": len(inv), "quantum_vulnerable": sum(f["status"] == "quantum-vulnerable" for f in inv)},
         "detection_eval": {k: {m: ev[k][m] for m in ("precision", "recall", "f1", "tp", "fp", "fn")}
                            for k in ("pq_bridge", "naive_grep")} if ev else {},
@@ -167,10 +192,16 @@ def report():
                                                          "p_optimal_uniform_random", "approx_ratio_mean")},
         "qrng": [{"purpose": q["purpose"], "device": q["run"]["device"], "shots": q["run"]["shots"],
                   "health": q["health"]} for q in qr],
-        "waves": [{"label": w["label"], "tasks": w["tasks"], "passed": w["passed"],
-                   "checks_passed": sum(c["passed"] for c in w["checks"]), "checks": len(w["checks"]),
-                   "rollback_s": (w["rollback"] or {}).get("restore_s"), "traffic": w["traffic_delta"]} for w in ws],
-        "payments_during_migration": {"settled": total_pay, "failed": failed_pay},
+        "migration": {"tasks_live": sum(bool(t["done"]) for t in core), "tasks_total": len(core),
+                      "live": [{"id": t["id"], "title": t["title"], "service": t["service"]} for t in core if t["done"]],
+                      "applied": len(applies), "promoted": sum(c["outcome"] == "promoted" for c in applies),
+                      "auto_rolled_back": sum(c["outcome"] == "rolled back" for c in applies),
+                      "failed_left": sum(c["outcome"] == "failed, left in place" for c in applies),
+                      "undone": sum(c["type"] == "rollback" for c in changes),
+                      "checks_passed": sum(c["checks_passed"] for c in applies), "checks": sum(c["checks"] for c in applies),
+                      "restore_s": [c["restore_s"] for c in changes if c["restore_s"] is not None]},
+        "changes": changes[::-1],
+        "during_changes": during,
     }
     (EVID / "report.json").write_text(json.dumps(out, indent=1))
     return out
@@ -183,7 +214,8 @@ def reset(keep_analysis=False):
     testbed.down(wipe=True)
     if EVID.exists():
         keep = {"inventory.json", "detection_eval.json", "risk.json", "risk_params.json", "plan.json", "qaoa.json",
-                "qrng_runs.jsonl", "ml_eval.json", "repo_findings.json", "tls_survey.json", "benchmarks.json"}
+                "qrng_runs.jsonl", "ml_eval.json", "repo_findings.json", "tls_survey.json", "benchmarks.json",
+                "notifications.jsonl"}
         for p in sorted(EVID.rglob("*"), reverse=True):
             if keep_analysis and (p.name in keep or "circuits" in p.parts):
                 continue

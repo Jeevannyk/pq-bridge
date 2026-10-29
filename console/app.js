@@ -14,24 +14,16 @@ async function poll() {
     // Dev auto-reload: any change under console/ bumps ui_version and the page reloads itself.
     if (UI_VERSION && s.ui_version !== UI_VERSION) return location.reload();
     UI_VERSION = s.ui_version;
-    const p = s.traffic.payments || {}, l = s.traffic.legacy || {}, g = s.traffic.ledger || {};
-    $("#k-ok").textContent = (p.ok ?? 0).toLocaleString();
-    $("#k-fail").textContent = (p.fail ?? 0).toLocaleString();
-    $("#k-fail").className = p.fail ? "badv" : "good";
-    $("#k-legacy").textContent = `${l.ok ?? 0} ok / ${l.fail ?? 0} fail`;
-    $("#k-ledger").textContent = (g.tx_count ?? 0).toLocaleString();
-    $("#k-alg").textContent = p.last_alg || "–";
     $("#chips").innerHTML = [
       ["QpiAI Opt key", s.keys.opt], ["QCloud key", s.keys.qcloud],
-    ].map(([n, on]) => `<span class="chip ${on ? "on" : "off"}">${n}: ${on ? "set" : "missing"}</span>`).join("")
-      + `<span class="chip">QCloud device: ${esc(s.qcloud_device)}</span>`;
-    $("#log").textContent = s.log.join("\n");
-    $("#log").scrollTop = 1e9;
+    ].map(([n, on]) => `<span class="chip ${on ? "on" : "off"}"><i></i>${n}: ${on ? "set" : "missing"}</span>`).join("")
+      + `<span class="chip"><i></i>QCloud device: ${esc(s.qcloud_device)}</span>`;
+    renderLog(s.log);
     const wasBusy = BUSY;
     BUSY = s.busy;
     $("#busy").hidden = !BUSY;
     $("#busy").textContent = BUSY ? `Running: ${BUSY}…` : "";
-    document.querySelectorAll("button[data-act], button[data-m]").forEach((b) => { if (b.dataset.m !== "probe" && b.dataset.m !== "analyse" && b.dataset.m !== "analyse-sample") b.disabled = !!BUSY; });
+    document.querySelectorAll("button[data-act], button[data-m]").forEach((b) => { if (b.dataset.m !== "probe") b.disabled = !!BUSY; });
     if (wasBusy && !BUSY) refresh();
   } catch (e) { /* server restarting */ }
 }
@@ -39,13 +31,38 @@ async function poll() {
 // ---------------------------------------------------------------- actions
 async function act(name, arg) {
   const path = { scan: "/api/scan", plan: "/api/plan", drill: "/api/drill", report: null, wave: `/api/wave/${arg}`,
-    repos: "/api/repos", survey: "/api/survey", bench: "/api/bench", circuits: "/api/circuits" }[name];
+    repos: "/api/repos", bench: "/api/bench", circuits: "/api/circuits",
+    notify: "/api/notify?bank=" + encodeURIComponent($("#notify-bank").value || ""),
+    alert: "/api/notify/alert?bank=" + encodeURIComponent($("#notify-bank").value || "") }[name];
   try {
-    if (path) { BUSY = name; poll(); await api(path, "POST"); }
-  } catch (e) { toast(`✗ ${name}: ${e.message}`, 12000); }
+    if (path) {
+      BUSY = name; poll();
+      const r = await api(path, "POST");
+      if (name === "alert") toast(r.sent ? `✓ CRITICAL alert emailed to ${r.recipients.join(", ")}
+Change on record: ${r.change.join(", ") || "none"}` : `No alert sent: ${r.reason}`, 10000);
+      if (name === "notify") toast(`✓ Report emailed to ${r.recipients.join(", ")}
+${r.bank}: ${r.findings} findings, ${r.pdf_kb} KB PDF attached`, 10000);
+    }
+  } catch (e) { toast(`✗ ${{ notify: "email report", alert: "email alert" }[name] || name}: ${e.message}`, 12000); }
   await refresh();
 }
-function alertBox(msg) { $("#log").textContent += `\n!! ${msg}`; }
+function alertBox(msg) { $("#log").insertAdjacentHTML("beforeend", logRow(`${new Date().toTimeString().slice(0, 8)}  ERROR ${msg}`)); }
+
+// Run log: one row per line, time in its own column, colour by what happened.
+function logRow(l) {
+  const m = /^(\d\d:\d\d:\d\d)\s+(.*)$/.exec(l) || ["", "", l];
+  const msg = m[2];
+  const kind = /ERROR|FAILED|FAILURES|PREFLIGHT|LEFT IN PLACE|NOT WORKING/.test(msg) ? "bad"
+    : /REFUSED|not sent|CRITICAL|rolling back/.test(msg) ? "warn"
+    : /PASSED|ALL PASS|promoted|healthy: True|Testbed up|EMAILED|done in/.test(msg) ? "ok" : "";
+  const body = esc(msg).replace(/^(\[[^\]]+\]|OPERATOR:|ALERT|EMAILED|REFUSED [\w ]+:|ERROR in [\w ]+:)/, '<b class="tg">$1</b>');
+  return `<div class="lr ${kind}"><time>${m[1]}</time><span>${body}</span></div>`;
+}
+function renderLog(lines) {
+  const el = $("#log"), stick = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  el.innerHTML = lines.map(logRow).join("");
+  if (stick) el.scrollTop = el.scrollHeight;
+}
 
 document.addEventListener("click", (e) => {
   const b = e.target.closest("button[data-act]");
@@ -64,58 +81,37 @@ async function showTrace(label, svc) {
   $("#trace-dlg").showModal();
 }
 
+// ---------------------------------------------------------------- email report
+async function renderNotify() {
+  try {
+    const c = await api("/api/notify"), sel = $("#notify-bank"), keep = sel.value;
+    sel.hidden = c.banks.length < 2;
+    sel.innerHTML = c.banks.map((b) => `<option value="${esc(b.id)}">${esc(b.name)}</option>`).join("");
+    if (keep) sel.value = keep;
+  } catch (e) { /* server restarting */ }
+}
+$("#notify-bank").onchange = renderNotify;
+
 // ---------------------------------------------------------------- inventory + risk
 function renderInventory() {
+  renderNotify();
   if (!INV || !INV.findings.length) return;
   const f = INV.findings, qv = f.filter((x) => x.status === "quantum-vulnerable");
-  const cats = {};
-  qv.forEach((x) => (cats[x.category] = (cats[x.category] || 0) + 1));
   $("#inv-summary").innerHTML =
-    tile("Findings", f.length, "with file / endpoint evidence") +
+    tile("Findings", f.length, "each with file / endpoint evidence") +
     tile("Quantum-vulnerable", qv.length, "RSA · ECDSA · ECDH · X25519") +
-    tile("PQ-safe", f.filter((x) => x.status === "pq-safe").length, "HQC · FN-DSA · SLH-DSA · hybrid") +
-    Object.entries(cats).map(([c, n]) => tile(c, n, "vulnerable")).join("");
-  $("#inv-sources").innerHTML = sourceStrip(f);
-  const ev = INV.eval;
-  if (ev) {
-    const row = (n, k) => `<tr><td>${n}</td><td class="num">${ev[k].precision}</td><td class="num">${ev[k].recall}</td><td class="num">${ev[k].f1}</td><td class="num">${ev[k].tp}/${ev[k].fp}/${ev[k].fn}</td></tr>`;
-    $("#inv-eval").innerHTML = `<div class="card"><h3>Detection accuracy on labelled corpus (${ev.labelled_positives} positives, ${ev.files} files, hard negatives included)</h3>
-      <div class="scroll"><table><tr><th>Detector</th><th>Precision</th><th>Recall</th><th>F1</th><th>TP/FP/FN</th></tr>
-      ${row("PQ-Bridge hybrid engine", "pq_bridge")}${ev.rules_only ? row("Rules only (previous scanner)", "rules_only") : ""}${row("Naive grep baseline", "naive_grep")}</table></div>
-      ${ev.pq_bridge.missed.length ? `<p>Missed: ${ev.pq_bridge.missed.map((m) => `<span class="mono">${esc(m[0])}:${m[1]}</span>`).join(", ")}</p>` : ""}</div>`;
-  }
+    tile("PQ-safe", f.filter((x) => x.status === "pq-safe").length, "HQC · FN-DSA · SLH-DSA") +
+    tile("Live TLS endpoints", f.filter((x) => x.category === "endpoint").length, "checked with real handshakes");
   const st = $("#f-status").value, cat = $("#f-cat").value;
   const rows = f.filter((x) => (!st || x.status === st) && (!cat || x.category === cat));
-  $("#inv-table").innerHTML = `<tr><th>Status</th><th>Service</th><th>Evidence</th><th>Found by</th><th>ML p</th><th>Severity</th><th>Algorithm</th><th>Verification</th><th>Snippet</th></tr>` +
+  $("#inv-table").innerHTML = `<tr><th>Status</th><th>Service</th><th>Where</th><th>Algorithm</th><th>Severity</th><th>Found by</th></tr>` +
     rows.map((x) => `<tr><td><span class="pill ${x.status === "pq-safe" ? "pq" : "qv"}">${x.status === "pq-safe" ? "PQ-safe" : "vulnerable"}</span></td>
-      <td>${esc(x.service || "–")}</td><td class="mono">${esc(x.file)}${x.line ? ":" + x.line : ""}</td>
-      <td>${foundBy(x)}</td><td class="num">${x.ml_p ?? "–"}</td>
+      <td>${esc(x.service || "–")}</td><td class="mono" title="${esc(x.snippet)}">${esc(x.file)}${x.line ? ":" + x.line : ""}</td>
+      <td>${esc(x.algorithm)}</td>
       <td>${x.severity ? `<span class="pill ${x.severity === "critical" || x.severity === "high" ? "qv" : ""}">${esc(x.severity)}</span>` : "–"}</td>
-      <td>${esc(x.algorithm)}</td><td>${esc(x.verification || verifiedBy(x))}</td><td class="mono">${esc(x.snippet)}</td></tr>`).join("");
+      <td>${esc({ code: "code scan", config: "config scan", certificate: "certificate", dependency: "dependency", endpoint: "live handshake" }[x.category] || x.category)}</td></tr>`).join("");
 }
 
-// Which part of the single engine produced a finding.
-function foundBy(x) {
-  if (x.category === "code" || x.category === "config") {
-    return x.detected_by === "rule" ? `<span class="pill warn">hybrid: rule + ML</span>` : `<span class="pill pass">hybrid: ML + verification</span>`;
-  }
-  return `<span class="pill">${{ certificate: "X.509 parser", dependency: "manifest parser", endpoint: "live TLS handshake" }[x.category] || esc(x.category)}</span>`;
-}
-const verifiedBy = (x) => ({ certificate: "parsed key type from the certificate", dependency: "exact package name", endpoint: "negotiated by a real handshake" }[x.category] || "–");
-
-// Top strip: sources -> one engine -> findings -> what they feed.
-function sourceStrip(f) {
-  const n = (fn) => f.filter(fn).length;
-  const hy = f.filter((x) => x.category === "code" || x.category === "config");
-  const box = (title, count, sub, hot) => `<div class="stage${hot ? " hot" : ""}"><span>${esc(title)}</span><b>${count}</b><small>${esc(sub)}</small></div>`;
-  return `<div class="pipe">
-    ${box("Code + nginx configs", hy.length, `${hy.filter((x) => x.detected_by === "rule").length} by rule, ${hy.filter((x) => x.detected_by !== "rule").length} by ML + verification`, true)}
-    <i>→</i>${box("Certificates + keys", n((x) => x.category === "certificate"), "X.509 parser", false)}
-    <i>→</i>${box("Dependencies", n((x) => x.category === "dependency"), "manifest parser", false)}
-    <i>→</i>${box("Live TLS endpoints", n((x) => x.category === "endpoint"), "real handshakes", false)}
-    <i>⇒</i>${box("One finding format", f.length, "evidence on every row", true)}
-    <i>⇒</i>${box("Feeds", "risk → plan → migrate", "QpiAI Opt uses these", false)}</div>`;
-}
 const tile = (l, v, s) => `<div class="tile"><span>${esc(l)}</span><b>${v}</b><br><small>${esc(s)}</small></div>`;
 
 function renderRisk() {
@@ -123,53 +119,37 @@ function renderRisk() {
   if (!r) return;
   const svc = Object.entries(r.services);
   $("#risk-body").className = "";
-  $("#risk-body").innerHTML = `<p class="empty">Mosca's inequality: data is at risk when shelf-life X + migration time Y (${r.migration_years} y) exceeds years-to-CRQC Z (${r.crqc_years} y, configurable assumption).</p>
-  <div class="scroll"><table><tr><th>Service</th><th>Risk</th><th></th><th>X + Y vs Z</th><th>Exposure</th><th>Vulnerable findings</th></tr>
-  ${svc.map(([s, v]) => `<tr><td><b>${s}</b><br><small class="empty">${esc(v.desc)}</small></td><td class="num">${v.score}</td>
-    <td style="min-width:140px"><div class="bar-h"><i style="width:${v.score * 10}%"></i></div></td>
-    <td class="num">${v.mosca.X} + ${v.mosca.Y} ${v.mosca.at_risk ? "&gt;" : "≤"} ${v.mosca.Z} ${v.mosca.at_risk ? '<span class="pill qv">at risk</span>' : ""}</td>
-    <td>${v.exposure === 1 ? "internet" : "internal"}</td><td class="num">${v.findings}</td></tr>`).join("")}</table></div>
-  <h3 style="margin:18px 0 6px;font-size:1rem">Task risk (input r<sub>t</sub> to the optimiser)</h3>
-  <div class="tasks">${Object.entries(r.tasks).sort((a, b) => b[1] - a[1]).map(([t, v]) => `<code>${t} · ${v}</code>`).join("")}</div>`;
+  $("#risk-body").innerHTML = `<div class="scroll"><table><tr><th>Service</th><th>What it does</th><th>Risk</th><th>Exposure</th><th>Vulnerable</th></tr>
+  ${svc.map(([s, v]) => `<tr><td><b>${s}</b></td><td style="min-width:260px">${esc(v.desc)}</td>
+    <td style="min-width:130px"><span class="num"><b>${v.score}</b></span><div class="bar-h" style="margin-top:4px"><i style="width:${v.score * 10}%"></i></div></td>
+    <td>${v.exposure === 1 ? "internet" : "internal"}</td><td class="num">${v.findings}</td></tr>`).join("")}</table></div>`;
 }
 
 // ---------------------------------------------------------------- plan
-function renderPlan(qr) {
+function renderPlan() {
   const p = PLAN;
   if (!p || !p.final_waves) return;
-  const W = p.windows, prim = p.primary, ex = p.baselines["OR-Tools CP-SAT (exact)"], gr = p.baselines["Greedy (risk-first, manual-style)"];
-  const deg = p.hubo.terms_by_degree;
-  const solverRows = [
-    [prim.solver + (prim.fallback_reason ? " ⚠" : ""), prim.objective, prim.violations.length, prim.wall_s, prim.optimality_gap_pct + "%"],
-    ["Final plan (after QAOA refinement)", p.final.objective, p.final.violations.length, "", ((p.final.objective - ex.objective) / ex.objective * 100).toFixed(2) + "%"],
-    [ex.solver, ex.objective, ex.violations.length, ex.wall_s, "0%"],
-    [gr.solver, gr.objective, gr.violations.length, "", ((gr.objective - ex.objective) / ex.objective * 100).toFixed(2) + "%"],
-  ];
-  const q = p.qaoa;
-  const gantt = `<div class="gantt" style="--w:${W}"><div class="row"><div></div>${[...Array(W).keys()].map((w) => `<div class="hdr">Window ${w}${w === 1 ? " · freeze" : ""}</div>`).join("")}</div>
-    ${p.tasks.map((t) => `<div class="row"><div class="lab" title="${esc(t.title)}">${t.id}</div>${[...Array(W).keys()].map((w) =>
-      `<div class="cell ${p.final_plan[t.id] === w ? "on" : ""} ${w === 1 && t.service === "ledger" ? "freeze" : ""}" title="${p.final_plan[t.id] === w ? esc(t.title) : ""}"></div>`).join("")}</div>`).join("")}</div>`;
+  const W = p.windows, prim = p.primary;
+  const byId = Object.fromEntries(p.tasks.map((t) => [t.id, t])), bk = p.blackout;
+  const kindName = { enabler: "prepare", confidentiality: "key exchange", authentication: "signatures" };
+  const wins = p.final_waves.map((ids, w) => {
+    const ts = ids.map((i) => byId[i]).filter(Boolean), effort = ts.reduce((a, t) => a + t.effort, 0);
+    const frozen = bk && bk.window === w;
+    return `<div class="win${frozen ? " frozen" : ""}">
+      <div class="win-head"><span>Window ${w}</span><b>${ts.length} tasks</b></div>
+      <div class="win-cap"><div class="bar-h"><i style="width:${Math.min(100, (100 * effort) / p.capacity)}%"></i></div><small>effort ${effort} of ${p.capacity}</small></div>
+      ${frozen ? `<p class="win-freeze"><b>Change freeze · ${esc(bk.reason)}.</b> The planner avoids ${esc(bk.services.join(", "))} in this window.</p>` : ""}
+      <ol class="win-list">${ts.map((t) => `<li><span class="win-title">${esc(t.title)}</span>
+        <span class="win-meta"><span class="kind ${t.kind}">${kindName[t.kind] || t.kind}</span><span class="pill">${esc(t.service)}</span>${frozen && bk.services.includes(t.service) ? '<span class="kind frz">in freeze</span>' : ""}<span class="mono">${t.id}</span></span></li>`).join("")}</ol></div>`;
+  }).join("");
   $("#plan-body").className = "";
   $("#plan-body").innerHTML = `
-  <div class="tiles">${tile("HUBO variables", p.hubo.variables, `${p.tasks.length} tasks × ${W} windows + slack`)}${tile("Terms", p.hubo.terms, `linear ${deg[1] || 0} · quad ${deg[2] || 0} · cubic ${deg[3] || 0}`)}
-    ${tile("Violations", p.final.violations.length, "precedence · capacity · blast radius")}${tile("Risk-weighted delay", p.final.objective, "lower is better")}</div>
   ${prim.fallback_reason ? `<p class="rollback" style="border-color:var(--accent);background:var(--accent-soft)">QpiAI Opt was not used for this plan: ${esc(prim.fallback_reason)}. Add QPIAI_OPT_API_KEY to .env and regenerate.</p>` : ""}
-  <div class="scroll"><table><tr><th>Solver</th><th>Objective</th><th>Violations</th><th>Time (s)</th><th>Gap vs exact</th></tr>
-    ${solverRows.map((r) => `<tr><td>${esc(r[0])}</td><td class="num">${r[1]}</td><td class="num">${r[2]}</td><td class="num">${r[3]}</td><td class="num">${r[4]}</td></tr>`).join("")}</table></div>
-  <h3 style="margin:20px 0 8px;font-size:1rem">Wave plan</h3>${gantt}
-  <p class="empty">Deferred: ${p.deferred.map((d) => `<b>${d.id}</b> (${esc(d.reason)})`).join("; ")}</p>
+  <h3 class="sub">Wave plan</h3>
+  <p class="hint">Windows run in order. Each window applies its tasks, runs the verification gate, then promotes or rolls back.</p>
+  <div class="wins">${wins}</div>
   <div class="grid2">
-    <div class="card"><h3>Remaining quantum exposure after each window</h3>${curve([["Final plan", p.final.exposure_curve_pct, "var(--steel)"], ["Greedy", gr.exposure_curve_pct, "var(--accent)"]])}</div>
-    <div class="card"><h3>QAOA cross-check · QpiAI QCloud</h3>
-      <p>Cluster <span class="mono">${q.cluster.join(", ")}</span> re-optimised with all other tasks fixed.</p>
-      <div class="tiles" style="margin-top:8px">${tile("Qubits", q.qubits, `${q.reps} QAOA layers · ${q.device}`)}${tile("Circuit runs", q.circuit_runs, `${q.shots} shots each`)}
-      ${tile("QAOA best", q.qaoa_best.energy, `optimum ${q.brute_force.energy}`)}${tile("P(optimum)", q.p_optimal, `uniform ${q.p_optimal_uniform_random}`)}</div>
-      <p>${q.found_optimum ? '<span class="pill pass">found brute-force optimum</span>' : '<span class="pill fail">optimum not reached</span>'}
-      ${q.qaoa_improves_plan ? ' <span class="pill pass">improved the plan</span>' : ""} mean approximation ratio ${q.approx_ratio_mean}</p>
-      ${spark(q.cvar_history)}</div>
-    <div class="card"><h3>Quantum randomness for PQC keys · QpiAI QCloud</h3>${qr.length ? qr.map((r) => `<p><b>${esc(r.purpose)}</b>: ${r.labels.length} key seeds (SLH-DSA root, FN-DSA leaves / JWT) from ${r.run.shots} shots × ${r.run.qubits} qubits on ${esc(r.run.device)}.
-      Health: monobit p=${r.health.monobit_p}, χ² p=${r.health.nibble_chi2_p}, max bias ${r.health.max_qubit_bias}
-      <span class="pill ${r.health.passed ? "pass" : "fail"}">${r.health.passed ? "pass" : "fail"}</span></p>`).join("") + `<p class="empty">${esc(qr[0].run.source_note)}. Seeds = HKDF-SHA256(quantum bits ‖ OS CSPRNG), mixed into OpenSSL's DRBG with genpkey -rand.</p>` : '<p>Keys are generated when the wave containing <span class="mono">pki.pq-root</span> runs.</p>'}</div>
+    <div class="card"><h3>Remaining quantum exposure after each window</h3>${curve([["Final plan", p.final.exposure_curve_pct, "var(--steel)"]])}</div>
   </div>`;
 }
 
@@ -182,13 +162,6 @@ function curve(series) {
      ${d.map((v, i) => `<circle cx="${x(i)}" cy="${y(v)}" r="3" fill="${c}"/>`).join("")}<text x="${W - 12}" y="${14 + k * 14}" text-anchor="end" style="fill:${c}">${name}</text>`).join("");
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Exposure curve">${grid}${xl}${lines}</svg>`;
 }
-function spark(h) {
-  if (!h || !h.length) return "";
-  const W = 320, H = 60, mn = Math.min(...h), mx = Math.max(...h), r = mx - mn || 1;
-  const pts = h.map((v, i) => `${(i * (W - 10)) / (h.length - 1) + 5},${5 + ((v - mn) * (H - 20)) / r}`).join(" ");
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%"><polyline fill="none" stroke="var(--steel)" stroke-width="1.5" points="${pts}"/><text x="5" y="${H - 2}">CVaR objective over ${h.length} optimiser steps (${h[0]} → ${h[h.length - 1]})</text></svg>`;
-}
-
 // ---------------------------------------------------------------- waves
 function renderWaves() {
   if (!PLAN || !PLAN.final_waves) return;
@@ -208,7 +181,7 @@ function waveCard(label, title, tasks, rec, btn) {
     const passed = rec.checks.filter((c) => c.passed).length;
     const svcs = Object.keys(rec.after);
     body = `<p><span class="pill ${rec.passed ? "pass" : "fail"}">${rec.passed ? "PROMOTED" : "GATE FAILED"}</span>
-      ${passed}/${rec.checks.length} gate checks · ${rec.traffic_delta.pay_ok} payments settled, ${rec.traffic_delta.pay_fail} failed during wave</p>
+      ${passed}/${rec.checks.length} gate checks · customer path during the wave: ${rec.traffic_delta.probe_ok} of ${rec.traffic_delta.probe_ops} requests succeeded (${rec.traffic_delta.probe_payments} payments), ${rec.traffic_delta.probe_failed} failed</p>
       <div class="scroll"><table><tr><th>Service</th><th>Before</th><th>After (gate)</th><th>Handshake bytes</th><th>p95 ms</th><th>Traces</th></tr>
       ${svcs.map((s) => { const b = rec.before[s], a = rec.after[s];
         return `<tr><td>${s}</td><td class="mono">${b ? `${b.group} / ${b.peer_sig}` : "–"}</td><td class="mono">${a.group} / ${a.peer_sig}</td>
@@ -224,20 +197,42 @@ function waveCard(label, title, tasks, rec, btn) {
 
 // ---------------------------------------------------------------- report
 async function renderReport() {
-  const r = await api("/api/report");
-  if (!r.waves.length) return;
-  $("#report-body").className = "";
-  const d = r.detection_eval || {};
-  $("#report-body").innerHTML = `<div class="tiles">
-    ${tile("Payments during migration", r.payments_during_migration.settled, `${r.payments_during_migration.failed} failed`)}
-    ${tile("Waves promoted", r.waves.filter((w) => w.passed && w.label !== "drill").length, `of ${r.waves.filter((w) => w.label !== "drill").length} run`)}
-    ${tile("Detection P / R", d.pq_bridge ? `${d.pq_bridge.precision} / ${d.pq_bridge.recall}` : "–", d.naive_grep ? `grep ${d.naive_grep.precision} / ${d.naive_grep.recall}` : "")}
-    ${tile("Exposure left", r.plan.exposure_curve_pct ? r.plan.exposure_curve_pct.at(-1) + "%" : "–", "after final window (plan)")}
-    ${tile("Rollbacks", r.waves.filter((w) => w.rollback_s != null).length, r.waves.filter((w) => w.rollback_s != null).map((w) => w.rollback_s + " s").join(", "))}</div>
-    <div class="scroll"><table><tr><th>Wave</th><th>Tasks</th><th>Gate</th><th>Payments ok / failed</th><th>Rollback</th></tr>
-    ${r.waves.map((w) => `<tr><td>${w.label}</td><td class="mono">${w.tasks.join(", ")}</td><td><span class="pill ${w.passed ? "pass" : "fail"}">${w.checks_passed}/${w.checks}</span></td>
-      <td class="num">${w.traffic.pay_ok} / ${w.traffic.pay_fail}</td><td class="num">${w.rollback_s != null ? w.rollback_s + " s" : "–"}</td></tr>`).join("")}</table></div>
-    <p class="empty">Evidence files: evidence/inventory.json, detection_eval.json, risk.json, plan.json, qaoa.json, qrng_runs.jsonl, waves.jsonl, traces/, report.json</p>`;
+  const r = await api("/api/report"), m = r.migration, el = $("#report-body");
+  if (!r.changes.length) { el.className = "empty"; el.textContent = "No migration yet. Apply a task on the Migrate page and its gate result appears here."; return; }
+  el.className = "";
+  const num0 = (n) => (n ?? 0).toLocaleString();
+  const when = (ts) => new Date(ts * 1000).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const pillFor = (o) => (o === "promoted" || o === "gate passed" ? "pass" : o === "undone by operator" ? "warn" : "fail");
+  const title = (c) => (c.type === "apply" ? (c.label || "").replace(/^manual-.*/, "Manual apply").replace(/^wave(\d+)$/, "Wave $1").replace(/^drill$/, "Fault drill") : c.type[0].toUpperCase() + c.type.slice(1));
+  const stat = (k, v, cls = "", sub = "") => `<div class="cs ${cls}"><span>${k}</span><b>${v}</b>${sub ? `<small>${sub}</small>` : ""}</div>`;
+  const d = r.during_changes;
+  const card = (c) => {
+    const tone = pillFor(c.outcome), gateOk = c.checks && c.checks_passed === c.checks;
+    const probe = [c.probe_retried ? `${c.probe_retried} retried` : "", c.probe_failed ? `${c.probe_failed} failed` : ""].filter(Boolean).join(" · ");
+    const notes = [c.failed_checks.length ? `Failed check: ${esc(c.failed_checks[0])}${c.failed_checks.length > 1 ? ` (+${c.failed_checks.length - 1} more)` : ""}` : "",
+      c.restore_s != null ? `Customer path healthy again in ${c.restore_s} s` : ""].filter(Boolean);
+    return `<div class="chg ${tone}">
+      <div class="chg-top"><b>${esc(title(c))}</b><span class="pill ${tone}">${esc(c.outcome)}</span><time>${when(c.ts)}</time></div>
+      ${c.tasks.length ? `<div class="chg-tasks mono">${esc(c.tasks.join(", "))}</div>` : ""}
+      <div class="chg-stats">
+        ${stat("Gate checks", c.checks ? `${c.checks_passed} / ${c.checks}` : "–", c.checks ? (gateOk ? "ok" : "bad") : "")}
+        ${stat("Customer path", c.probe_ops == null ? "–" : `${c.probe_ops - c.probe_failed} / ${c.probe_ops}`, c.probe_failed ? "bad" : "", probe)}
+        ${stat("Real customers", c.customer_requests == null ? "–" : num0(c.customer_requests), c.customer_5xx ? "bad" : "", c.customer_5xx ? `${c.customer_5xx} retried errors` : "")}
+        ${stat("Applied in", c.apply_s != null ? `${c.apply_s} s` : "–")}
+      </div>
+      ${notes.map((n) => `<p class="chg-note">${n}</p>`).join("")}</div>`;
+  };
+  el.innerHTML = `<div class="tiles">
+    ${tile("Tasks live now", `${m.tasks_live} / ${m.tasks_total}`, "read from the running bank")}
+    ${tile("Changes applied", m.applied, `${m.promoted} promoted by the gate`)}
+    ${tile("Rolled back", m.auto_rolled_back + m.undone, `${m.auto_rolled_back} by the gate · ${m.undone} by the operator`)}
+    ${tile("Customer path during changes", d.operations ? `${d.operations - d.failed} / ${d.operations}` : "–", `${d.payments} payments · ${d.retried} needed a retry · slowest ${d.slowest_s} s`)}
+    ${tile("Real customers during changes", num0(d.customer_requests), `${d.customer_5xx} server errors, retried quietly by NetBank`)}</div>
+    ${m.live.length ? `<h3 class="sub">In effect now</h3><div class="tags">${m.live.map((t) => `<span class="tag"><b>${esc(t.id)}</b> ${esc(t.service)}</span>`).join("")}</div>` : ""}
+    <h3 class="sub">Every change, newest first</h3>
+    <div class="chgs">${r.changes.map(card).join("")}</div>
+    <div class="legend"><p><b>Customer path</b>: a simulated customer signs in, reads balances and pays while the change is applied. A request that needed a retry still succeeded for the customer.</p>
+    <p><b>Real customers</b>: requests NetBank users made through the gateway during the change.</p></div>`;
 }
 
 async function refresh() {
@@ -245,10 +240,9 @@ async function refresh() {
     INV = await api("/api/inventory");
     renderInventory(); renderRisk();
     PLAN = await api("/api/plan");
-    const qr = await api("/api/qrng");
     WAVES = await api("/api/waves");
-    renderPlan(qr); renderWaves(); await renderReport();
-    renderReal(await api("/api/repos")); renderSurvey(await api("/api/survey"));
+    renderPlan(); renderWaves(); await renderReport();
+    renderReal(await api("/api/repos"));
     renderBench(await api("/api/bench")); renderCircuits(await api("/api/circuits"));
     if (window.afterRefresh) await window.afterRefresh();
   } catch (e) { alertBox(e.message); }

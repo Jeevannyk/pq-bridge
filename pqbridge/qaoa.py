@@ -1,35 +1,36 @@
 """QAOA cross-check of the schedule on QpiAI QCloud.
 
-The full schedule (76 binaries) is solved by QpiAI Opt. Here one dependency
-cluster (the JWT chain + card-auth key exchange) is re-optimised with every
+The full schedule (82 binaries) is solved by QpiAI Opt. Here one dependency
+cluster (the settlement rollout: KMS key, clearing-house trust, SLH-DSA signer; 6 qubits, the QCloud
+free-tier cap) is re-optimised with every
 other task fixed to the Opt plan. The cluster sub-QUBO is mapped to an Ising
 Hamiltonian and solved with a QAOA circuit built gate-by-gate in the QpiAI
 Quantum SDK. The result is compared with the brute-force optimum.
 """
 import itertools
 import json
-import math
 import time
 
 import numpy as np
 from scipy.optimize import minimize
 
 from . import config
-from .qubo import BLACKOUT_COST, CAP, PEN, WINDOWS, blackout_cost
+from .qubo import CAP, PEN, WINDOWS, blackout_cost, domains
 from .tasks import TASK_BY_ID, TASKS
 
-CLUSTER = ["jwt.dual-verify", "jwt.sign-fndsa", "kex.card-auth"]
+MAX_QUBITS = 6
+CLUSTER = ["kms.key-settlement", "partner.clearing", "settle.sign-slhdsa"]   # 3 tasks x 2 windows = 6 qubits
 
 
 def sub_qubo(plan, risks, cluster=CLUSTER):
     fixed = {t: w for t, w in plan.items() if t not in cluster}
     load = [sum(TASK_BY_ID[t]["effort"] for t, w in fixed.items() if w == k) for k in range(WINDOWS)]
     # allowed windows per free task: respect fixed prerequisites and fixed dependents
-    allowed = {}
+    allowed, dom = {}, domains()                     # domains(): exact pruning by dependency chains
     for t in cluster:
         lo = max([fixed[d] + 1 for d in TASK_BY_ID[t]["deps"] if d in fixed], default=0)
         hi = min([fixed[s["id"]] - 1 for s in TASKS if t in s["deps"] and s["id"] in fixed], default=WINDOWS - 1)
-        allowed[t] = [w for w in range(lo, hi + 1) if load[w] + TASK_BY_ID[t]["effort"] <= CAP]
+        allowed[t] = [w for w in range(lo, hi + 1) if w in dom[t] and load[w] + TASK_BY_ID[t]["effort"] <= CAP]
     var = [(t, w) for t in cluster for w in allowed[t]]
     idx = {v: i for i, v in enumerate(var)}
     lin = np.zeros(len(var))
@@ -114,6 +115,8 @@ def qaoa_circuit(n, h, J, gammas, betas):
 def run(plan, risks, reps=2, shots=2048, maxiter=50, restarts=4, seed=7, log=print):
     var, lin, quad, const, allowed, load = sub_qubo(plan, risks)
     n = len(var)
+    if n > MAX_QUBITS:
+        raise RuntimeError(f"QAOA cluster needs {n} qubits; the QCloud free tier allows {MAX_QUBITS}")
     opt_bits, opt_e, all_e = brute_force(n, lin, quad, const)
     h, J = to_ising(n, lin, quad)
     rng = np.random.default_rng(seed)

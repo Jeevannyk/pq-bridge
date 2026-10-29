@@ -17,7 +17,7 @@ from scipy.stats import chi2
 
 from . import config
 
-N_QUBITS = 16
+N_QUBITS = 6                  # QpiAI QCloud free tier cap
 BITS_PER_SEED = 256
 MIN_SAMPLE_BITS = 4096
 

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PQBank NetBanking</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section id="login" class="login" hidden>
+  <div class="login-brand">
+    <div class="logo">PQBank</div>
+    <h1>Internet banking,<br>built for the quantum era.</h1>
+    <p>Check balances, pay anyone, and download statements. Every request travels over mutually authenticated TLS between our services, and the bank is migrating them to post-quantum cryptography.</p>
+  </div>
+  <div class="login-card">
+    <h2>Sign in</h2>
+    <form id="login-form" autocomplete="on" novalidate>
+      <label for="u">Username</label>
+      <input id="u" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" required>
+      <p id="login-error" class="error" role="alert" hidden></p>
+      <button class="primary wide" type="submit">Sign in</button>
+    </form>
+    <details class="demo">
+      <summary>Demo customers</summary>
+      <table>
+        <tr><th>Username</th><th>Password</th><th>Accounts</th></tr>
+        <tr><td>vamsh</td><td>vamsh</td><td>ACC-0004, ACC-0005</td></tr>
+        <tr><td>rahul</td><td>Rahul#Bank2026</td><td>ACC-0006, ACC-0007</td></tr>
+        <tr><td>meera</td><td>Meera#Bank2026</td><td>ACC-0008, ACC-0009</td></tr>
+      </table>
+      <p>Demo environment only. Five wrong passwords lock a user for a minute.</p>
+    </details>
+  </div>
+</section>
+
+<div id="app" hidden>
+  <header class="top">
+    <a class="logo" href="#/overview">PQBank</a>
+    <nav id="nav" aria-label="Main">
+      <a href="#/overview">Overview</a>
+      <a href="#/statement">Statement</a>
+      <a href="#/pay">Pay &amp; transfer</a>
+      <a href="#/payees">Payees</a>
+      <a href="#/profile">Profile</a>
+    </nav>
+    <div class="who"><span id="who"></span><button id="signout" class="ghost small" type="button">Sign out</button></div>
+  </header>
+  <main id="view" tabindex="-1"></main>
+  <footer class="foot">PQBank demo · connection secured with TLS · you are signed out after 10 minutes of inactivity</footer>
+</div>
+
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

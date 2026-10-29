@@ -1,13 +1,20 @@
 name: pqbank
 
+# PQBank: 8 bank services + 1 external partner + the legacy customer app + the operator toolbox.
+# Signing keys live in runtime/kms and are mounted into the kms container only (and the toolbox, which issues them).
+
 x-node: &node
   build: .
   image: pqbridge-node:latest
   networks: [bank]
   restart: unless-stopped
 
+x-svc-vols: &svcvols
+  - ./runtime/pki:/pki:ro
+  - ./runtime/state:/state:ro
+  - ./runtime/conf:/conf:ro
+
 services:
-  # Operator toolbox on the bank network: issues certificates and runs TLS probes for the gate.
   toolbox:
     <<: *node
     entrypoint: ["sleep", "infinity"]
@@ -15,41 +22,77 @@ services:
       - ./runtime/pki:/pki
       - ./runtime/state:/state
       - ./runtime/evidence:/evidence
+      - ./runtime/kms:/kms
+      - ./runtime/clearing-trust:/clearing-trust
+
+  postgres:
+    <<: *node
+    command: ["postgres"]
+    volumes:
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state:ro
+      - ./runtime/conf:/conf:ro
+      - pg-data:/data
+
+  kms:
+    <<: *node
+    command: ["kms"]
+    volumes:
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state:ro
+      - ./runtime/conf:/conf:ro
+      - ./runtime/kms:/kms:ro
+
+  clearing:
+    <<: *node
+    command: ["clearing"]
+    volumes:
+      - ./runtime/pki:/pki:ro
+      - ./runtime/state:/state:ro
+      - ./runtime/conf:/conf:ro
+      - ./runtime/clearing-trust:/clearing-trust:ro
+      - clearing-data:/data
+
+  identity:
+    <<: *node
+    command: ["identity"]
+    volumes: *svcvols
+    depends_on: [postgres, kms]
+
+  ledger:
+    <<: *node
+    command: ["ledger"]
+    volumes: *svcvols
+    depends_on: [postgres, kms]
+
+  accounts:
+    <<: *node
+    command: ["accounts"]
+    volumes: *svcvols
+    depends_on: [postgres, identity]
+
+  payments:
+    <<: *node
+    command: ["payments"]
+    volumes: *svcvols
+    depends_on: [postgres, identity, ledger]
+
+  settlement:
+    <<: *node
+    command: ["settlement"]
+    volumes: *svcvols
+    depends_on: [postgres, kms, clearing]
 
   gateway:
     <<: *node
     command: ["gateway"]
     ports: ["8443:443"]
-    volumes: &svcvols
-      - ./runtime/pki:/pki:ro
-      - ./runtime/state:/state:ro
-      - ./runtime/conf:/conf:ro
-
-  card-auth:
-    <<: *node
-    command: ["card-auth"]
-    volumes: *svcvols
-
-  payment-switch:
-    <<: *node
-    command: ["payment-switch"]
-    volumes: *svcvols
-
-  ledger:
-    <<: *node
-    command: ["ledger"]
     volumes:
       - ./runtime/pki:/pki:ro
       - ./runtime/state:/state:ro
       - ./runtime/conf:/conf:ro
-      - ledger-data:/data
-
-  loadgen:
-    <<: *node
-    command: ["loadgen"]
-    volumes:
-      - ./runtime/pki:/pki:ro
-      - ./runtime/state:/state
+      - ../netbank/frontend:/netbank:ro
+    depends_on: [identity, accounts, payments]
 
   legacy:
     <<: *node
@@ -57,9 +100,11 @@ services:
     volumes:
       - ./runtime/pki:/pki:ro
       - ./runtime/state:/state
+    depends_on: [gateway]
 
 networks:
   bank: {}
 
 volumes:
-  ledger-data: {}
+  pg-data: {}
+  clearing-data: {}
